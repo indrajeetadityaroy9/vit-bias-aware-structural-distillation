@@ -10,25 +10,13 @@ echo "  - Use 1 GPU"
 echo "  - Run evaluation"
 echo ""
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_NAME="smoke_test_${TIMESTAMP}"
+cd "$(dirname "$0")/.."
 
-echo "Experiment name: $EXPERIMENT_NAME"
-echo ""
-
-modal run modal_train.py \
-    --config-path configs/mnist_test_config.yaml \
-    --num-gpus 1 \
-    --experiment-name "$EXPERIMENT_NAME"
+python main.py train configs/mnist_test_config.yaml --num-gpus 1
 
 if [ $? -eq 0 ]; then
     echo ""
     echo "Smoke Test Passed!"
-    echo ""
-    echo "Experiment: $EXPERIMENT_NAME"
-    echo ""
-    echo "To download results:"
-    echo "  modal volume get cnn-training-vol outputs/$EXPERIMENT_NAME ./results/$EXPERIMENT_NAME"
     echo ""
 else
     echo ""

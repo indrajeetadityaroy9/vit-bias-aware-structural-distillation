@@ -1,12 +1,18 @@
 import argparse
 import logging
-import subprocess
+import os
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from src.config import (
     ConfigManager,
@@ -20,140 +26,290 @@ from src.config import (
 from src.models import ModelFactory
 from src.datasets import DatasetManager, preprocess_image
 from src.evaluation import ModelEvaluator, TestTimeAugmentation
-from src.visualization import FeatureMapVisualizer, GradCAM
+from src.training import DDPTrainer
+from src.visualization import FeatureMapVisualizer, GradCAM, TrainingVisualizer
 
 logger = logging.getLogger(__name__)
 
-def train_on_modal(config_path, num_gpus=1, experiment_name=None):
+
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+
+def train_worker(
+    rank: int,
+    world_size: int,
+    config_path: str
+):
+    """DDP training worker for a single GPU process."""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '29500'
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(rank)
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    is_main_process = (rank == 0)
+
+    config = ConfigManager.load_config(config_path)
+
+    if world_size > 1:
+        config.experiment_name = f"{config.experiment_name}_ddp_{world_size}gpu"
+
+    output_dir = Path(config.output_dir) / config.experiment_name
+    checkpoints_dir = output_dir / "checkpoints"
+
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    dist.barrier()
+
+    if is_main_process:
+        setup_logging(config.logging)
+        logger = logging.getLogger(__name__)
+        logger.info("=" * 60)
+        logger.info("PyTorch Distributed Data Parallel (DDP) Training")
+        logger.info("=" * 60)
+        logger.info(f"Experiment: {config.experiment_name}")
+        logger.info(f"Dataset: {config.data.dataset}")
+        logger.info(f"World Size: {world_size}")
+        logger.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
+        logger.info("Backend: NCCL")
+        logger.info("=" * 60)
+    else:
+        logging.basicConfig(level=logging.ERROR)
+        logger = logging.getLogger(__name__)
+
+    set_seed(config.seed + rank)
+
+    if is_main_process:
+        logger.info(f"Process {rank}: Using device cuda:{rank}")
+        logger.info(f"GPU Name: {torch.cuda.get_device_name(rank)}")
+        logger.info(f"Total GPUs Available: {torch.cuda.device_count()}")
+
+    dataset_info = DatasetManager.get_dataset_info(config)
+    config.model.in_channels = dataset_info['in_channels']
+    config.model.num_classes = dataset_info['num_classes']
+    config.model.dataset = config.data.dataset
+
+    model = ModelFactory.create_model(config.model.model_type, config.model.__dict__)
+    model = model.to(device)
+
+    model = DDP(
+        model,
+        device_ids=[rank],
+        output_device=rank,
+        find_unused_parameters=False
+    )
+
+    if is_main_process:
+        total_params = sum(p.numel() for p in model.module.parameters())
+        trainable_params = sum(p.numel() for p in model.module.parameters() if p.requires_grad)
+        logger.info("Model wrapped with DistributedDataParallel")
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+        logger.info(f"Effective batch size: {config.data.batch_size * world_size}")
+
+    if is_main_process:
+        logger.info("Creating distributed data loaders...")
+
+    train_dataset = DatasetManager.get_dataset(config, is_train=True)
+    val_dataset = DatasetManager.get_dataset(config, is_train=False)
+    test_dataset = DatasetManager.get_dataset(config, is_train=False)
+
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=config.seed,
+        drop_last=True
+    )
+
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.data.batch_size,
+        sampler=train_sampler,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.data.batch_size,
+        sampler=val_sampler,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory
+    )
+
+    if is_main_process:
+        logger.info(f"Train samples: {len(train_dataset)} ({len(train_dataset)//world_size} per GPU)")
+        logger.info(f"Val samples: {len(val_dataset)} ({len(val_dataset)//world_size} per GPU)")
+        logger.info(f"Test samples: {len(test_dataset)}")
+
+    ddp_trainer = DDPTrainer(model, config, device, rank, world_size)
+
+    checkpoint_path = checkpoints_dir / f"best_model_{config.data.dataset}_ddp.pth"
+
+    if is_main_process:
+        if checkpoint_path.exists():
+            logger.info(f"Found checkpoint: {checkpoint_path}")
+            try:
+                ddp_trainer.load_checkpoint(checkpoint_path)
+                logger.info(f"Resumed from epoch {ddp_trainer.current_epoch}")
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}")
+        else:
+            logger.info("No checkpoint found. Starting fresh training.")
+
+    dist.barrier()
+
+    if is_main_process:
+        logger.info("=" * 60)
+        logger.info("STARTING DDP TRAINING")
+        logger.info("=" * 60)
+
+    metrics_history = ddp_trainer.train_ddp(train_loader, train_sampler, val_loader)
+
+    if is_main_process:
+        logger.info("=" * 60)
+        logger.info("EVALUATING ON TEST SET")
+        logger.info("=" * 60)
+
+        evaluator = ModelEvaluator(ddp_trainer.model, device, dataset_info.get('classes'))
+        test_metrics = evaluator.evaluate(test_loader)
+        evaluator.print_summary()
+
+        ConfigManager.save_config(config, output_dir / 'config.yaml')
+
+        if metrics_history:
+            TrainingVisualizer.plot_training_history(
+                metrics_history,
+                save_path=output_dir / 'training_history.png'
+            )
+
+        evaluator.plot_confusion_matrix(
+            save_path=output_dir / 'confusion_matrix.png',
+            normalize=True
+        )
+
+        metrics_file = output_dir / 'test_metrics.txt'
+        with open(metrics_file, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("FINAL TEST METRICS (DDP Training)\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Configuration: {world_size} GPUs with DDP\n")
+            f.write(f"Effective Batch Size: {config.data.batch_size * world_size}\n\n")
+            f.write(f"Accuracy:          {test_metrics['accuracy']:.4f}\n")
+            f.write(f"Precision (macro): {test_metrics['precision_macro']:.4f}\n")
+            f.write(f"Recall (macro):    {test_metrics['recall_macro']:.4f}\n")
+            f.write(f"F1 Score (macro):  {test_metrics['f1_macro']:.4f}\n")
+            f.write(f"Loss:              {test_metrics.get('loss', 'N/A')}\n")
+
+            if 'auc_macro' in test_metrics:
+                f.write(f"\nAUC Macro: {test_metrics['auc_macro']:.4f}\n")
+                f.write(f"AUC Weighted: {test_metrics['auc_weighted']:.4f}\n")
+
+        logger.info("=" * 60)
+        logger.info("DDP TRAINING COMPLETED SUCCESSFULLY")
+        logger.info(f"Experiment: {config.experiment_name}")
+        logger.info(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
+        logger.info(f"Outputs saved to: {output_dir}")
+        logger.info("=" * 60)
+
+        result = {
+            'experiment_name': config.experiment_name,
+            'test_accuracy': test_metrics['accuracy'],
+            'output_dir': str(output_dir),
+            'num_gpus': world_size
+        }
+    else:
+        result = None
+
+    dist.destroy_process_group()
+    return result
+
+
+def train_locally(config_path: str, num_gpus: int = 1):
+    """Train on local GPUs using DDP for multi-GPU."""
     config_file = Path(config_path)
     if not config_file.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    available_gpus = torch.cuda.device_count()
+    if available_gpus == 0:
+        raise RuntimeError("No CUDA GPUs available. Please check your GPU setup.")
+
+    if num_gpus > available_gpus:
+        print(f"Requested {num_gpus} GPUs, but only {available_gpus} available. Using {available_gpus}.")
+        num_gpus = available_gpus
+
     print(f"\n{'='*60}")
-    print("Starting Modal GPU Training")
+    print("PyTorch Distributed Data Parallel (DDP) Training")
     print(f"{'='*60}")
     print(f"Config: {config_path}")
-    print(f"GPUs: {num_gpus}")
-    print(f"Experiment: {experiment_name or 'auto-generated'}")
+    print(f"GPUs: {num_gpus} x {torch.cuda.get_device_name(0)}")
+    print(f"Mode: {'DDP Multi-GPU' if num_gpus > 1 else 'Single GPU'}")
     print(f"{'='*60}\n")
 
-    cmd = [
-        "modal", "run", "modal_train.py",
-        "--config-path", config_path,
-        "--num-gpus", str(num_gpus)
-    ]
+    if num_gpus == 1:
+        result = train_worker(0, 1, config_path)
+    else:
+        mp.spawn(train_worker, args=(num_gpus, config_path), nprocs=num_gpus, join=True)
+        result = {"status": "completed", "num_gpus": num_gpus}
 
-    if experiment_name:
-        cmd.extend(["--experiment-name", experiment_name])
-
-    try:
-        result = subprocess.run(cmd, check=True)
+    if result and isinstance(result, dict):
         print(f"\n{'='*60}")
-        print("Training completed successfully!")
+        print("TRAINING COMPLETED")
+        print(f"{'='*60}")
+        if 'test_accuracy' in result:
+            print(f"Experiment: {result['experiment_name']}")
+            print(f"Test Accuracy: {result['test_accuracy']:.4f}")
+            print(f"GPUs Used: {result['num_gpus']}")
+            print(f"Output Directory: {result['output_dir']}")
+        else:
+            print(f"DDP Training completed with {result.get('num_gpus', num_gpus)} GPUs")
         print(f"{'='*60}\n")
-        print("To download results:")
-        print("python main.py download --list")
-        print("python main.py download --experiment <name> --output ./results")
-        return result.returncode
-    except subprocess.CalledProcessError as e:
-        print(f"\n{'='*60}")
-        print("Training failed!")
-        print(f"{'='*60}\n")
-        print(f"Error: {e}")
-        return e.returncode
-    except FileNotFoundError:
-        return 1
 
-def download_from_modal(list_only=False, experiment_name=None, checkpoint_name=None, output_dir='./downloads'):
-    VOLUME_NAME = "cnn-training-vol"
+    return 0
 
-    try:
-        if list_only:
-            print(f"\n{'='*60}")
-            print("Available Experiments and Checkpoints")
-            print(f"{'='*60}\n")
-
-            print("Experiments (outputs):")
-            print("-" * 60)
-            result = subprocess.run(
-                ["modal", "volume", "ls", VOLUME_NAME, "/vol/outputs"],
-                capture_output=True, text=True, check=True
-            )
-            print(result.stdout if result.stdout else "No experiments found")
-
-            print("\nCheckpoints:")
-            print("-" * 60)
-            result = subprocess.run(
-                ["modal", "volume", "ls", VOLUME_NAME, "/vol/checkpoints"],
-                capture_output=True, text=True, check=True
-            )
-            print(result.stdout if result.stdout else "No checkpoints found")
-            print(f"{'='*60}\n")
-            return 0
-
-        if experiment_name:
-            remote_path = f"/vol/outputs/{experiment_name}"
-            local_path = Path(output_dir) / experiment_name
-            local_path.mkdir(parents=True, exist_ok=True)
-
-            print(f"\n{'='*60}")
-            print(f"Downloading experiment: {experiment_name}")
-            print(f"{'='*60}")
-            print(f"From: {VOLUME_NAME}:{remote_path}")
-            print(f"To: {local_path}")
-            print(f"{'='*60}\n")
-
-            result = subprocess.run(
-                ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
-                check=True
-            )
-
-            print(f"\n{'='*60}")
-            print("Download completed!")
-            print(f"{'='*60}")
-            print(f"Files saved to: {local_path}")
-            print("\nContents:")
-            for item in local_path.rglob('*'):
-                if item.is_file():
-                    print(f"- {item.relative_to(local_path)}")
-            print(f"{'='*60}\n")
-            return result.returncode
-
-        if checkpoint_name:
-            remote_path = f"/vol/checkpoints/{checkpoint_name}"
-            local_path = Path(output_dir) / "checkpoints"
-            local_path.mkdir(parents=True, exist_ok=True)
-
-            print(f"\n{'='*60}")
-            print(f"Downloading checkpoint: {checkpoint_name}")
-            print(f"{'='*60}")
-            print(f"From: {VOLUME_NAME}:{remote_path}")
-            print(f"To: {local_path / checkpoint_name}")
-            print(f"{'='*60}\n")
-
-            result = subprocess.run(
-                ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path / checkpoint_name)],
-                check=True
-            )
-
-            print(f"\n{'='*60}")
-            print("Download completed!")
-            print(f"{'='*60}")
-            print(f"Checkpoint saved to: {local_path / checkpoint_name}")
-            print("\nTo use for evaluation:")
-            print(f"python main.py evaluate <config> {local_path / checkpoint_name}")
-            print(f"{'='*60}\n")
-            return result.returncode
-        return 1
-
-    except subprocess.CalledProcessError as e:
-        print(f"\nError downloading from Modal: {e}")
-        if e.stderr:
-            print(f"Details: {e.stderr}")
-        return e.returncode
 
 def evaluate_model(config_path, checkpoint_path):
-
+    """Evaluate a trained model on the test set."""
     config = ConfigManager.load_config(config_path)
     setup_logging(config.logging)
 
@@ -202,8 +358,9 @@ def evaluate_model(config_path, checkpoint_path):
     misclassified = evaluator.get_misclassified_samples(n_samples=20)
     logger.info(f"Top misclassified samples: {misclassified[:5]}")
 
-def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
 
+def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
+    """Test model on a single image with visualization."""
     config = ConfigManager.load_config(config_path)
     setup_logging(config.logging)
 
@@ -234,7 +391,6 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
 
     if use_tta:
         tta = TestTimeAugmentation(model, device, n_augmentations=10)
-
         transforms = []
         output = tta.predict(image, transforms)
     else:
@@ -287,6 +443,7 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
             save_path=output_dir / 'gradcam.png'
         )
 
+
 def main():
     parser = argparse.ArgumentParser(
         description='Adaptive CNN Training System',
@@ -295,22 +452,10 @@ def main():
 
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
 
-    train_parser = subparsers.add_parser('train', help='Train a model on Modal GPU infrastructure')
+    train_parser = subparsers.add_parser('train', help='Train a model on local GPUs')
     train_parser.add_argument('config', type=str, help='Path to configuration file')
     train_parser.add_argument('--num-gpus', type=int, default=1,
-                             help='Number of GPUs to use (1-8, default: 1)')
-    train_parser.add_argument('--experiment-name', type=str,
-                             help='Optional experiment name')
-
-    download_parser = subparsers.add_parser('download', help='Download model weights and artifacts from Modal')
-    download_parser.add_argument('--list', action='store_true', dest='list_only',
-                                help='List available experiments and checkpoints')
-    download_parser.add_argument('--experiment', type=str, dest='experiment_name',
-                                help='Download entire experiment output directory')
-    download_parser.add_argument('--checkpoint', type=str, dest='checkpoint_name',
-                                help='Download specific checkpoint file')
-    download_parser.add_argument('--output', type=str, default='./downloads',
-                                help='Local directory to save downloads (default: ./downloads)')
+                             help='Number of GPUs to use (default: 1)')
 
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate a trained model locally')
     eval_parser.add_argument('config', type=str, help='Path to configuration file')
@@ -325,9 +470,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'train':
-        train_on_modal(args.config, args.num_gpus, args.experiment_name)
-    elif args.command == 'download':
-        download_from_modal(args.list_only, args.experiment_name, args.checkpoint_name, args.output)
+        return train_locally(args.config, args.num_gpus)
     elif args.command == 'evaluate':
         evaluate_model(args.config, args.checkpoint)
     elif args.command == 'test':
@@ -335,5 +478,8 @@ def main():
     else:
         parser.print_help()
 
+    return 0
+
+
 if __name__ == '__main__':
-    main()
+    exit(main())

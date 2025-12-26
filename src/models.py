@@ -80,44 +80,78 @@ class AdaptiveCNN(nn.Module):
         logger.info(f"Initialized AdaptiveCNN for {self.dataset} dataset")
 
     def _build_mnist_architecture(self):
+        """Build deeper MNIST architecture for 99%+ accuracy.
+
+        Architecture: 6 residual blocks with SE attention
+        - Stage 1: 32 channels (14x14) - 2 blocks
+        - Stage 2: 64 channels (7x7) - 2 blocks
+        - Stage 3: 128 channels (4x4) - 2 blocks
+        """
         self.features = nn.ModuleList([
+            # Initial convolution (28x28 -> 14x14)
             nn.Sequential(
-                nn.Conv2d(self.in_channels, 32, kernel_size=5, padding=2),
+                nn.Conv2d(self.in_channels, 32, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(32),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(2)
             ),
+            # Stage 1: 32 channels (14x14)
+            ResidualBlock(32, 32, stride=1, use_se=self.use_se),
+            ResidualBlock(32, 32, stride=1, use_se=self.use_se),
+            # Stage 2: 64 channels (14x14 -> 7x7)
             ResidualBlock(32, 64, stride=2, use_se=self.use_se),
             ResidualBlock(64, 64, stride=1, use_se=self.use_se),
+            # Stage 3: 128 channels (7x7 -> 4x4)
+            ResidualBlock(64, 128, stride=2, use_se=self.use_se),
+            ResidualBlock(128, 128, stride=1, use_se=self.use_se),
         ])
+
+        # Classifier
         self.classifier = nn.Sequential(
-            nn.Linear(64, 128),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(128, self.num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(64, self.num_classes)
         )
 
     def _build_cifar_architecture(self):
+        """Build deeper CIFAR architecture for 90%+ accuracy.
+
+        Architecture: 11 residual blocks with SE attention
+        - Stage 1: 64 channels (32x32) - 2 blocks
+        - Stage 2: 128 channels (16x16) - 3 blocks
+        - Stage 3: 256 channels (8x8) - 3 blocks
+        - Stage 4: 512 channels (4x4) - 3 blocks
+        """
         self.features = nn.ModuleList([
+            # Initial convolution (32x32 -> 32x32)
             nn.Sequential(
-                nn.Conv2d(self.in_channels, 64, kernel_size=3, padding=1),
+                nn.Conv2d(self.in_channels, 64, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
             ),
+            # Stage 1: 64 channels (32x32)
+            ResidualBlock(64, 64, stride=1, use_se=self.use_se),
+            ResidualBlock(64, 64, stride=1, use_se=self.use_se),
+            # Stage 2: 128 channels (32x32 -> 16x16)
             ResidualBlock(64, 128, stride=2, use_se=self.use_se),
             ResidualBlock(128, 128, stride=1, use_se=self.use_se),
+            ResidualBlock(128, 128, stride=1, use_se=self.use_se),
+            # Stage 3: 256 channels (16x16 -> 8x8)
             ResidualBlock(128, 256, stride=2, use_se=self.use_se),
             ResidualBlock(256, 256, stride=1, use_se=self.use_se),
+            ResidualBlock(256, 256, stride=1, use_se=self.use_se),
+            # Stage 4: 512 channels (8x8 -> 4x4)
             ResidualBlock(256, 512, stride=2, use_se=self.use_se),
+            ResidualBlock(512, 512, stride=1, use_se=self.use_se),
+            ResidualBlock(512, 512, stride=1, use_se=self.use_se),
         ])
+        # Simplified classifier
         self.classifier = nn.Sequential(
             nn.Linear(512, 256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(128, self.num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(256, self.num_classes)
         )
 
     def _build_custom_architecture(self, config):

@@ -47,6 +47,14 @@ class LabelSmoothingCrossEntropy(nn.Module):
     def forward(self, pred, target):
         n_classes = pred.size(-1)
         log_pred = torch.log_softmax(pred, dim=-1)
+
+        # Handle soft labels (from CutMix/MixUp) - target is [batch, num_classes] float
+        if target.dim() > 1 and target.size(-1) == n_classes:
+            # Soft labels: use KL divergence style loss
+            loss = -(target * log_pred).sum(dim=-1)
+            return loss.mean()
+
+        # Handle hard labels (integer indices) - original behavior
         loss = -log_pred.sum(dim=-1)
         nll = -log_pred.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
         smooth_loss = loss / n_classes

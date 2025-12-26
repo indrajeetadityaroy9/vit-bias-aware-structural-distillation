@@ -1,0 +1,66 @@
+data:
+  augmentation:
+    color_jitter: false        # Disabled - conflicts with AutoAugment
+    cutout: true               # Complements AutoAugment
+    random_crop: true          # Essential augmentation
+    random_flip: true          # Essential augmentation
+    auto_augment: true         # ENABLED - powerful learned augmentation policy
+    cutmix: true               # ENABLED - better than mixup for CIFAR
+    cutmix_alpha: 1.0          # Standard alpha for beta distribution
+  batch_size: 512
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean:
+    - 0.4914
+    - 0.4822
+    - 0.4465
+    std:
+    - 0.2470
+    - 0.2435
+    - 0.2616
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+device: cuda
+experiment_name: cifar_improved
+logging:
+  log_dir: ./logs
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false
+  wandb_entity: null
+  wandb_project: adaptive-cnn
+model:
+  architecture: []
+  classifier_layers: []
+  dropout: 0.3                 # REDUCED from 0.5 - less regularization needed with augmentation
+  in_channels: 3
+  model_type: adaptive_cnn
+  num_classes: 10
+  use_se: true
+output_dir: ./outputs
+seed: 42
+training:
+  amp_backend: native
+  early_stopping: true
+  early_stopping_min_delta: 0.0005   # REDUCED - more sensitive to improvements
+  early_stopping_patience: 30        # INCREASED from 10 - allow longer plateaus
+  gradient_accumulation_steps: 1
+  gradient_clip_val: 1.0
+  label_smoothing: 0.1               # Works well with CutMix
+  learning_rate: 0.2
+  lr_scheduler_params:
+    T_max: 100
+    eta_min: 0.00001                 # REDUCED - allow finer tuning at end
+  num_epochs: 100
+  optimizer: sgd
+  scheduler: cosine
+  swa_lr: 0.0005
+  swa_start_epoch: 0.75              # SWA starts at epoch 150
+  use_amp: true
+  use_swa: true
+  warmup_epochs: 10
+  weight_decay: 0.0005

@@ -102,8 +102,8 @@ class CutMixDataset(Dataset):
         W = size[2]
         H = size[1]
         cut_rat = np.sqrt(1. - lam)
-        cut_w = np.int(W * cut_rat)
-        cut_h = np.int(H * cut_rat)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
 
         cx = np.random.randint(W)
         cy = np.random.randint(H)
