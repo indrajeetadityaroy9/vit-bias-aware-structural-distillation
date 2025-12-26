@@ -39,9 +39,10 @@ class Cutout:
 
 class MixUpDataset(Dataset):
 
-    def __init__(self, dataset, alpha=1.0):
+    def __init__(self, dataset, alpha=1.0, num_classes=10):
         self.dataset = dataset
         self.alpha = alpha
+        self.num_classes = num_classes
 
     def __len__(self):
         return len(self.dataset)
@@ -55,9 +56,8 @@ class MixUpDataset(Dataset):
         lam = np.random.beta(self.alpha, self.alpha) if self.alpha > 0 else 1
         img = lam * img1 + (1 - lam) * img2
 
-        num_classes = 10
-        target1_oh = torch.zeros(num_classes)
-        target2_oh = torch.zeros(num_classes)
+        target1_oh = torch.zeros(self.num_classes)
+        target2_oh = torch.zeros(self.num_classes)
         target1_oh[target1] = 1
         target2_oh[target2] = 1
 
@@ -67,9 +67,10 @@ class MixUpDataset(Dataset):
 
 class CutMixDataset(Dataset):
 
-    def __init__(self, dataset, alpha=1.0):
+    def __init__(self, dataset, alpha=1.0, num_classes=10):
         self.dataset = dataset
         self.alpha = alpha
+        self.num_classes = num_classes
 
     def __len__(self):
         return len(self.dataset)
@@ -88,9 +89,8 @@ class CutMixDataset(Dataset):
 
         lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (img1.size()[-1] * img1.size()[-2]))
 
-        num_classes = 10
-        target1_oh = torch.zeros(num_classes)
-        target2_oh = torch.zeros(num_classes)
+        target1_oh = torch.zeros(self.num_classes)
+        target2_oh = torch.zeros(self.num_classes)
         target1_oh[target1] = 1
         target2_oh[target2] = 1
 
@@ -132,6 +132,11 @@ class DatasetManager:
                     transform_list.append(transforms.RandomAffine(
                         degrees=0, translate=(0.1, 0.1)
                     ))
+                # RandAugment for MNIST (must be before ToTensor)
+                if aug_config.get('randaugment'):
+                    n_ops = aug_config.get('randaugment_n', 2)
+                    magnitude = aug_config.get('randaugment_m', 9)
+                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
 
             transform_list.extend([
                 transforms.Resize((28, 28)),
@@ -159,6 +164,11 @@ class DatasetManager:
                     transform_list.append(transforms.AutoAugment(
                         transforms.AutoAugmentPolicy.CIFAR10
                     ))
+                # RandAugment for CIFAR (must be before ToTensor)
+                if aug_config.get('randaugment'):
+                    n_ops = aug_config.get('randaugment_n', 2)
+                    magnitude = aug_config.get('randaugment_m', 9)
+                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
 
             transform_list.extend([
                 transforms.Resize((32, 32)),
@@ -184,6 +194,11 @@ class DatasetManager:
                     transform_list.append(transforms.ColorJitter(
                         brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
                     ))
+                # RandAugment for custom datasets (must be before ToTensor)
+                if aug_config.get('randaugment'):
+                    n_ops = aug_config.get('randaugment_n', 2)
+                    magnitude = aug_config.get('randaugment_m', 9)
+                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
 
             size = aug_config.get('image_size', 224)
             transform_list.extend([
@@ -242,10 +257,12 @@ class DatasetManager:
             )
 
         if is_train:
+            # Determine num_classes for MixUp/CutMix
+            num_classes = config.model.num_classes if hasattr(config, 'model') and hasattr(config.model, 'num_classes') else 10
             if config.data.augmentation.get('mixup'):
-                dataset = MixUpDataset(dataset, alpha=config.data.augmentation.get('mixup_alpha', 1.0))
+                dataset = MixUpDataset(dataset, alpha=config.data.augmentation.get('mixup_alpha', 1.0), num_classes=num_classes)
             elif config.data.augmentation.get('cutmix'):
-                dataset = CutMixDataset(dataset, alpha=config.data.augmentation.get('cutmix_alpha', 1.0))
+                dataset = CutMixDataset(dataset, alpha=config.data.augmentation.get('cutmix_alpha', 1.0), num_classes=num_classes)
 
         return dataset
 

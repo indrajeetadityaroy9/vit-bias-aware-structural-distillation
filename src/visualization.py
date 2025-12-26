@@ -142,11 +142,17 @@ class GradCAM:
         def backward_hook(module, grad_input, grad_output):
             self.gradients = grad_output[0].detach()
 
+        layer_found = False
         for name, module in self.model.named_modules():
             if name == self.target_layer:
                 module.register_forward_hook(forward_hook)
                 module.register_full_backward_hook(backward_hook)
+                layer_found = True
                 break
+
+        if not layer_found:
+            logger.warning(f"GradCAM target layer '{self.target_layer}' not found in model. "
+                          f"Available layers: {[n for n, _ in self.model.named_modules() if n]}")
 
     def generate_heatmap(self, image, class_idx=None):
         self.model.eval()

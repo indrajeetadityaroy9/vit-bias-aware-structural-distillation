@@ -5,10 +5,12 @@ A modular CNN classification pipeline that dynamically adjusts its architecture 
 ## Features
 
 1. **Adaptive Architecture Design**: A single model class that dynamically instantiates dataset-specific layer configurations with ResidualBlocks and SE attention
-2. **Multi-GPU Training**: Distributed Data Parallel (DDP) support for efficient multi-GPU training
-3. **Advanced Augmentation**: AutoAugment, CutMix, Cutout, and traditional augmentations
-4. **Modern Training Techniques**: Mixed precision (AMP), Stochastic Weight Averaging (SWA), label smoothing, cosine annealing
-5. **Interpretability Tools**: GradCAM, feature map visualization, confusion matrices, ROC curves
+2. **Vision Transformer (DeiT/ViT)**: Data-efficient Image Transformer with optional knowledge distillation from CNN teachers
+3. **Multi-GPU Training**: Distributed Data Parallel (DDP) support for efficient multi-GPU training
+4. **Knowledge Distillation**: Hard/soft distillation with configurable alpha scheduling (constant, linear, cosine)
+5. **Advanced Augmentation**: RandAugment, MixUp, CutMix, Cutout, and traditional augmentations
+6. **Modern Training Techniques**: Mixed precision (AMP/BF16), Stochastic Weight Averaging (SWA), label smoothing, cosine annealing
+7. **Interpretability Tools**: GradCAM, feature map visualization, confusion matrices, ROC curves
 
 ## Architecture
 
@@ -49,12 +51,40 @@ ResidualBlock(512→512) × 2 + SE            → 512×4×4
 AdaptiveAvgPool + Classifier(512→256→10)
 ```
 
-Both architectures employ:
+Both CNN architectures employ:
 - **Residual Connections** for gradient flow in deep networks
 - **Squeeze-and-Excitation (SE) Blocks** for channel attention
 - **Batch Normalization** after each convolutional layer
 - **Dropout** (p=0.3) for regularization
 - **ReLU activations** for non-linearity
+
+### DeiT/ViT Architecture
+
+**DeiT-Tiny Configuration** (~4M parameters):
+```
+Input (C×H×W)
+    ↓
+Hybrid Patch Embedding (Conv Stem + Projection)
+    ↓
+[CLS] + [DIST]* + Patch Tokens + Positional Embedding
+    ↓
+Transformer Encoder × 12
+  - Multi-Head Self-Attention (3 heads)
+  - MLP (ratio=2.0)
+  - Drop Path (0.1)
+  - Layer Normalization
+    ↓
+Classification Head (CLS token → num_classes)
+Distillation Head* (DIST token → num_classes)
+
+* Only present when distillation=true
+```
+
+**Key Features:**
+- **Hybrid Patch Embedding**: Conv stem for better local feature extraction before patch projection
+- **Class Token Dropout**: Regularization by replacing CLS token with patch mean (10% probability)
+- **Flexible Inference**: Choose between CLS, DIST, or averaged outputs
+- **Distillation Token**: Optional token for knowledge transfer from CNN teachers
 
 ## Dataset Preprocessing
 
@@ -111,39 +141,110 @@ Both architectures employ:
 
 ## Results
 
-### MNIST Performance
+### Model Comparison
+
+| Model | MNIST | CIFAR-10 |
+|-------|-------|----------|
+| **AdaptiveCNN** | 99.08% | 82.90% |
+| **DeiT (Distilled)** | 99.54% | 84.39% |
+| **ViT (No Distillation)** | **99.64%** | **86.02%** |
+
+### AdaptiveCNN (Teacher) Performance
+
+**MNIST** (709K parameters):
 
 | Metric | Score |
 |--------|-------|
-| **Accuracy** | **99.75%** |
-| **Precision (Macro)** | 0.9975 |
-| **Recall (Macro)** | 0.9975 |
-| **F1-Score (Macro)** | 0.9975 |
-| **Top-3 Accuracy** | 99.99% |
+| **Accuracy** | **99.08%** |
+| **Precision (Macro)** | 0.9908 |
+| **Recall (Macro)** | 0.9908 |
+| **F1-Score (Macro)** | 0.9908 |
+
+**CIFAR-10** (17.6M parameters):
+
+| Metric | Score |
+|--------|-------|
+| **Accuracy** | **82.90%** |
+| **Precision (Macro)** | 0.8290 |
+| **Recall (Macro)** | 0.8290 |
+| **F1-Score (Macro)** | 0.8290 |
+
+### DeiT with Knowledge Distillation
+
+**MNIST** (3.9M parameters, distilled from AdaptiveCNN):
+
+| Metric | Score |
+|--------|-------|
+| **Accuracy** | **99.54%** |
+| **Precision (Macro)** | 0.9954 |
+| **Recall (Macro)** | 0.9954 |
+| **F1-Score (Macro)** | 0.9954 |
+
+**CIFAR-10** (4.3M parameters, distilled from AdaptiveCNN):
+
+| Metric | Score |
+|--------|-------|
+| **Accuracy** | **84.39%** |
+| **Precision (Macro)** | 0.8431 |
+| **Recall (Macro)** | 0.8439 |
+| **F1-Score (Macro)** | 0.8422 |
+
+### ViT without Distillation (Baseline)
+
+**MNIST** (3.9M parameters):
+
+| Metric | Score |
+|--------|-------|
+| **Accuracy** | **99.64%** |
+| **Precision (Macro)** | 0.9964 |
+| **Recall (Macro)** | 0.9964 |
+| **F1-Score (Macro)** | 0.9964 |
 | **AUC (Macro)** | 1.0000 |
 
-### CIFAR-10 Performance
+**CIFAR-10** (4.3M parameters):
 
 | Metric | Score |
 |--------|-------|
-| **Accuracy** | **95.55%** |
-| **Precision (Macro)** | 0.9556 |
-| **Recall (Macro)** | 0.9555 |
-| **F1-Score (Macro)** | 0.9555 |
-| **Top-3 Accuracy** | 99.54% |
-| **AUC (Macro)** | 0.9983 |
+| **Accuracy** | **86.02%** |
+| **Precision (Macro)** | 0.8600 |
+| **Recall (Macro)** | 0.8602 |
+| **F1-Score (Macro)** | 0.8591 |
+| **AUC (Macro)** | 0.9886 |
+
+### Negative Transfer Effect Analysis
+
+A key finding from our experiments: **ViT without distillation outperforms DeiT with distillation**.
+
+**CIFAR-10 Results:**
+```
+ViT (86.02%) > DeiT (84.39%) > CNN (82.90%)
+       +1.63%         +1.49%
+```
+
+**Root Cause:** The teacher CNN (82.90%) was weaker than what the student could achieve independently. This caused:
+
+1. **Negative Knowledge Transfer** - DeiT was constrained by the teacher's suboptimal representations
+2. **Teacher Ceiling Effect** - With α=0.6, 60% of the loss pushed toward the teacher's 82.9% accuracy ceiling
+3. **Constrained Optimization** - Hard distillation forced matching teacher predictions instead of learning optimal features
+
+**Key Insight:** Knowledge distillation only helps when the teacher significantly outperforms the student's potential. With a weak teacher, distillation can limit rather than enhance student performance.
 
 ### Training Time (2× NVIDIA H100 80GB)
 
-| Dataset | Training Time | Epochs |
-|---------|---------------|--------|
-| MNIST | ~1 minute | 50 |
-| CIFAR-10 | ~7 minutes | 100 |
+| Model | Dataset | Training Time | Epochs |
+|-------|---------|---------------|--------|
+| AdaptiveCNN | MNIST | ~1 minute | 20 |
+| AdaptiveCNN | CIFAR-10 | ~4 minutes | 40 |
+| DeiT (Distilled) | MNIST | ~4 minutes | 50 |
+| DeiT (Distilled) | CIFAR-10 | ~12 minutes | 100 |
+| ViT | MNIST | ~4 minutes | 50 |
+| ViT | CIFAR-10 | ~17 minutes | 100 |
 
 ## Usage
 
 ### Training
 
+**AdaptiveCNN:**
 ```bash
 # Train MNIST on single GPU
 python main.py train configs/mnist_improved_config.yaml
@@ -153,6 +254,24 @@ python main.py train configs/mnist_improved_config.yaml --num-gpus 2
 
 # Train CIFAR-10 on multiple GPUs with DDP
 python main.py train configs/cifar_improved_config.yaml --num-gpus 2
+```
+
+**ViT (without distillation):**
+```bash
+# Train ViT on MNIST
+python main.py train configs/vit_mnist_config.yaml --num-gpus 2
+
+# Train ViT on CIFAR-10
+python main.py train configs/vit_cifar_config.yaml --num-gpus 2
+```
+
+**DeiT (with knowledge distillation):**
+```bash
+# First train the teacher (AdaptiveCNN)
+python main.py train configs/cifar_improved_config.yaml --num-gpus 2
+
+# Then train DeiT with distillation from the teacher
+python main.py train-distill configs/deit_cifar_config.yaml --num-gpus 2
 ```
 
 ### Evaluation
@@ -176,11 +295,17 @@ python main.py test configs/cifar_improved_config.yaml ./outputs/checkpoints/bes
 
 ```
 ├── configs/                    # Configuration files
-│   ├── mnist_improved_config.yaml
-│   └── cifar_improved_config.yaml
+│   ├── mnist_improved_config.yaml    # AdaptiveCNN for MNIST
+│   ├── cifar_improved_config.yaml    # AdaptiveCNN for CIFAR-10
+│   ├── vit_mnist_config.yaml         # ViT for MNIST (no distillation)
+│   ├── vit_cifar_config.yaml         # ViT for CIFAR-10 (no distillation)
+│   ├── deit_mnist_config.yaml        # DeiT for MNIST (with distillation)
+│   └── deit_cifar_config.yaml        # DeiT for CIFAR-10 (with distillation)
 ├── src/
 │   ├── config.py              # Configuration management
 │   ├── models.py              # AdaptiveCNN with ResidualBlock + SE
+│   ├── vit.py                 # DeiT/ViT implementation
+│   ├── distillation.py        # Knowledge distillation trainer
 │   ├── datasets.py            # Data loading and augmentation
 │   ├── training.py            # Trainer and DDPTrainer classes
 │   ├── evaluation.py          # Metrics and visualization

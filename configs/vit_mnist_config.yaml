@@ -1,0 +1,87 @@
+data:
+  augmentation:
+    random_rotation: true
+    random_affine: true
+    cutout: true
+    randaugment: true
+    randaugment_n: 2
+    randaugment_m: 9
+  batch_size: 1024
+  data_path: ./data
+  dataset: mnist
+  normalization:
+    mean:
+    - 0.1307
+    std:
+    - 0.3081
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+
+device: cuda
+experiment_name: vit_mnist
+output_dir: ./outputs
+seed: 42
+
+logging:
+  log_dir: ./logs
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false
+  wandb_entity: null
+  wandb_project: adaptive-cnn
+
+model:
+  model_type: deit
+  in_channels: 1
+  num_classes: 10
+  architecture: []
+  classifier_layers: []
+  dropout: 0.0
+  use_se: true
+
+vit:
+  variant: tiny
+  img_size: 28
+  patch_size: 2
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 2.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: false
+  convert_grayscale: true
+  use_conv_stem: true
+  cls_token_dropout: 0.1
+  inference_mode: cls
+
+training:
+  num_epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.0005
+  lr_scheduler_params:
+    T_max: 50
+    eta_min: 0.00001
+  label_smoothing: 0.1
+  use_swa: false
+  swa_start_epoch: 0.75
+  swa_lr: 0.0001
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true

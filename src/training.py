@@ -8,8 +8,14 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 from collections import defaultdict
-from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig
+from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig, ViTConfig, DistillationConfig
+
 logger = logging.getLogger(__name__)
+
+# Check PyTorch version for H100 optimizations
+PYTORCH_VERSION = tuple(int(x) for x in torch.__version__.split('.')[:2])
+HAS_PYTORCH_2 = PYTORCH_VERSION >= (2, 0)
+HAS_PYTORCH_2_1 = PYTORCH_VERSION >= (2, 1)
 
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.001, mode='min'):
@@ -67,6 +73,12 @@ class Trainer:
         self.config = config
         self.device = device
 
+        # Enable TF32 for H100 (and other Ampere+ GPUs)
+        if config.training.use_tf32 and device.type == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("TF32 enabled for matmul and cuDNN operations")
+
         if config.training.label_smoothing > 0:
             self.criterion = LabelSmoothingCrossEntropy(config.training.label_smoothing)
         else:
@@ -78,9 +90,18 @@ class Trainer:
 
         self.use_amp = config.training.use_amp and device.type == 'cuda'
         self.autocast_kwargs = {}
+        self.scaler = None
         if self.use_amp:
-            self.scaler = GradScaler()
-            self.autocast_kwargs = {'device_type': 'cuda'}
+            # Use BF16 for better numerical stability on H100
+            if config.training.use_bf16:
+                # BF16 has same exponent range as FP32, so GradScaler is not needed
+                self.autocast_kwargs = {'device_type': 'cuda', 'dtype': torch.bfloat16}
+                logger.info("Using BF16 mixed precision (H100 optimized) - GradScaler disabled")
+            else:
+                # FP16 needs GradScaler for numerical stability
+                self.scaler = GradScaler()
+                self.autocast_kwargs = {'device_type': 'cuda'}
+                logger.info("Using FP16 mixed precision with GradScaler")
 
         self.use_swa = config.training.use_swa
         if self.use_swa:
@@ -108,18 +129,48 @@ class Trainer:
 
         self.metrics_history = defaultdict(list)
 
+        # torch.compile support
+        self.use_compile = config.training.use_compile
+        self.compile_mode = config.training.compile_mode
+
+    def compile_model(self):
+        """Apply torch.compile optimization to the model."""
+        if self.use_compile:
+            if not HAS_PYTORCH_2:
+                logger.warning("torch.compile requires PyTorch 2.0+. Skipping compilation.")
+                return False
+            if self.compile_mode == 'max-autotune' and not HAS_PYTORCH_2_1:
+                logger.warning("compile_mode='max-autotune' requires PyTorch 2.1+. Using 'default' mode.")
+                self.compile_mode = 'default'
+            logger.info(f"Compiling model with mode='{self.compile_mode}' (H100 optimized)")
+            self.model = torch.compile(self.model, mode=self.compile_mode)
+            return True
+        return False
+
     def _create_optimizer(self):
         opt_name = self.config.training.optimizer.lower()
         lr = self.config.training.learning_rate
         wd = self.config.training.weight_decay
+        # Fused optimizers require PyTorch 2.0+ and CUDA
+        use_fused = (self.config.training.use_fused_optimizer and
+                     self.device.type == 'cuda' and HAS_PYTORCH_2)
+
+        if not HAS_PYTORCH_2 and self.config.training.use_fused_optimizer:
+            logger.warning("Fused optimizers require PyTorch 2.0+. Using standard optimizers.")
 
         if opt_name == 'adam':
-            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
+            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd,
+                              fused=use_fused)
         elif opt_name == 'adamw':
-            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+            if use_fused:
+                logger.info("Using fused AdamW optimizer (H100 optimized)")
+            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd,
+                               fused=use_fused)
         elif opt_name == 'sgd':
+            if use_fused:
+                logger.info("Using fused SGD optimizer (H100 optimized)")
             return optim.SGD(self.model.parameters(), lr=lr, weight_decay=wd,
-                           momentum=0.9, nesterov=True)
+                             momentum=0.9, nesterov=True, fused=use_fused)
         elif opt_name == 'rmsprop':
             return optim.RMSprop(self.model.parameters(), lr=lr, weight_decay=wd)
         else:
@@ -182,7 +233,7 @@ class Trainer:
         if self.scheduler:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
-        if self.use_amp:
+        if self.use_amp and self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
 
         if self.use_swa:
@@ -209,7 +260,7 @@ class Trainer:
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        if self.use_amp and 'scaler_state_dict' in checkpoint:
+        if self.use_amp and self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         if self.use_swa and 'swa_model_state_dict' in checkpoint:
@@ -231,9 +282,26 @@ class DDPTrainer(Trainer):
         self.rank = rank
         self.world_size = world_size
         self.is_main_process = (rank == 0)
-        
+
         import torch.distributed as dist
         self.dist = dist
+
+    def compile_model(self):
+        """Apply torch.compile optimization to the DDP model."""
+        if self.use_compile:
+            if not HAS_PYTORCH_2:
+                if self.is_main_process:
+                    logger.warning("torch.compile requires PyTorch 2.0+. Skipping compilation.")
+                return False
+            if self.compile_mode == 'max-autotune' and not HAS_PYTORCH_2_1:
+                if self.is_main_process:
+                    logger.warning("compile_mode='max-autotune' requires PyTorch 2.1+. Using 'default' mode.")
+                self.compile_mode = 'default'
+            if self.is_main_process:
+                logger.info(f"Compiling DDP model with mode='{self.compile_mode}' (H100 optimized)")
+            self.ddp_model = torch.compile(self.ddp_model, mode=self.compile_mode)
+            return True
+        return False
 
     def train_epoch_ddp(self, train_loader, train_sampler):
         # Set epoch for distributed sampler (different shuffle each epoch)
@@ -260,19 +328,34 @@ class DDPTrainer(Trainer):
                     loss = self.criterion(outputs, targets)
                     loss = loss / self.grad_accum_steps
 
-                self.scaler.scale(loss).backward()
+                if self.scaler is not None:
+                    # FP16 with GradScaler
+                    self.scaler.scale(loss).backward()
 
-                if (batch_idx + 1) % self.grad_accum_steps == 0:
-                    if self.config.training.gradient_clip_val > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.ddp_model.parameters(),
-                            self.config.training.gradient_clip_val
-                        )
+                    if (batch_idx + 1) % self.grad_accum_steps == 0:
+                        if self.config.training.gradient_clip_val > 0:
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.ddp_model.parameters(),
+                                self.config.training.gradient_clip_val
+                            )
 
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad()
+                else:
+                    # BF16 without GradScaler
+                    loss.backward()
+
+                    if (batch_idx + 1) % self.grad_accum_steps == 0:
+                        if self.config.training.gradient_clip_val > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.ddp_model.parameters(),
+                                self.config.training.gradient_clip_val
+                            )
+
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
             else:
                 outputs = self.ddp_model(inputs)
                 loss = self.criterion(outputs, targets)

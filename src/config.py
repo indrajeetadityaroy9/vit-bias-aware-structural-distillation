@@ -37,7 +37,10 @@ class TrainingConfig:
                  use_amp=True, amp_backend="native", early_stopping=True,
                  early_stopping_patience=10, early_stopping_min_delta=0.001,
                  lr_scheduler_params=None, label_smoothing=0.1, use_swa=True,
-                 swa_start_epoch=0.75, swa_lr=0.0005):
+                 swa_start_epoch=0.75, swa_lr=0.0005,
+                 # H100 optimization flags
+                 use_bf16=True, use_compile=True, compile_mode='max-autotune',
+                 use_fused_optimizer=True, use_tf32=True):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -56,6 +59,12 @@ class TrainingConfig:
         self.use_swa = use_swa
         self.swa_start_epoch = swa_start_epoch
         self.swa_lr = swa_lr
+        # H100 optimization flags
+        self.use_bf16 = use_bf16  # Use BF16 instead of FP16 for better numerical stability
+        self.use_compile = use_compile  # Enable torch.compile for graph optimization
+        self.compile_mode = compile_mode  # 'max-autotune', 'reduce-overhead', or 'default'
+        self.use_fused_optimizer = use_fused_optimizer  # Use fused AdamW/SGD kernels
+        self.use_tf32 = use_tf32  # Enable TF32 for matmul operations
 
 class LoggingConfig:
     def __init__(self, log_level="INFO", log_dir="./logs", wandb=False,
@@ -69,13 +78,78 @@ class LoggingConfig:
         self.save_frequency = save_frequency
         self.track_grad_norm = track_grad_norm
 
+
+class ViTConfig:
+    """Vision Transformer (DeiT) specific configuration."""
+
+    def __init__(self, variant='tiny', img_size=32, patch_size=4,
+                 embed_dim=192, depth=12, num_heads=3, mlp_ratio=4.0,
+                 drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1,
+                 distillation=True, convert_grayscale=True,
+                 # New generalized improvements
+                 use_conv_stem=False, cls_token_dropout=0.0, inference_mode='avg'):
+        self.variant = variant
+        self.img_size = img_size
+        self.patch_size = patch_size
+
+        # Set defaults based on variant if not explicitly provided
+        variant_configs = {
+            'tiny': {'embed_dim': 192, 'num_heads': 3},
+            'small': {'embed_dim': 384, 'num_heads': 6},
+            'base': {'embed_dim': 768, 'num_heads': 12},
+        }
+        if variant in variant_configs:
+            self.embed_dim = embed_dim if embed_dim != 192 else variant_configs[variant]['embed_dim']
+            self.num_heads = num_heads if num_heads != 3 else variant_configs[variant]['num_heads']
+        else:
+            self.embed_dim = embed_dim
+            self.num_heads = num_heads
+
+        self.depth = depth
+        self.mlp_ratio = mlp_ratio
+        self.drop_rate = drop_rate
+        self.attn_drop_rate = attn_drop_rate
+        self.drop_path_rate = drop_path_rate
+        self.distillation = distillation
+        self.convert_grayscale = convert_grayscale
+
+        # New generalized improvements
+        self.use_conv_stem = use_conv_stem  # Enable hybrid conv stem for better local features
+        self.cls_token_dropout = cls_token_dropout  # Probability of replacing cls token with patch mean
+        self.inference_mode = inference_mode  # 'cls', 'dist', or 'avg' for inference
+
+
+class DistillationConfig:
+    """Knowledge distillation configuration."""
+
+    def __init__(self, teacher_checkpoint=None, teacher_model_type='adaptive_cnn',
+                 distillation_type='hard', alpha=0.5, tau=3.0,
+                 distillation_warmup_epochs=0,
+                 # Alpha scheduling for distillation
+                 alpha_schedule='constant', alpha_start=0.0, alpha_end=0.5):
+        self.teacher_checkpoint = teacher_checkpoint
+        self.teacher_model_type = teacher_model_type
+        self.distillation_type = distillation_type  # 'hard' or 'soft'
+        self.alpha = alpha  # Weight for distillation loss (used when alpha_schedule='constant')
+        self.tau = tau  # Temperature for soft distillation
+        self.distillation_warmup_epochs = distillation_warmup_epochs  # Epochs without distillation
+
+        # Alpha scheduling: 'constant', 'linear', or 'cosine'
+        self.alpha_schedule = alpha_schedule
+        self.alpha_start = alpha_start  # Starting alpha (after warmup)
+        self.alpha_end = alpha_end  # Ending alpha (at final epoch)
+
+
 class Config:
     def __init__(self, data=None, model=None, training=None, logging=None,
+                 vit=None, distillation=None,
                  experiment_name="default", seed=42, device="cuda", output_dir="./outputs"):
         self.data = data
         self.model = model
         self.training = training
         self.logging = logging
+        self.vit = vit  # ViT-specific configuration
+        self.distillation = distillation  # Knowledge distillation configuration
         self.experiment_name = experiment_name
         self.seed = seed
         self.device = device
@@ -99,13 +173,24 @@ class ConfigManager:
         else:
             raise ValueError(f"Unsupported config format: {config_path.suffix}")
 
+        # Parse optional vit and distillation configs
+        vit_config = None
+        if 'vit' in raw_config:
+            vit_config = ViTConfig(**raw_config['vit'])
+
+        distillation_config = None
+        if 'distillation' in raw_config:
+            distillation_config = DistillationConfig(**raw_config['distillation'])
+
         config = Config(
             data=DataConfig(**raw_config.get('data', {})),
             model=ModelConfig(**raw_config.get('model', {})),
             training=TrainingConfig(**raw_config.get('training', {})),
             logging=LoggingConfig(**raw_config.get('logging', {})),
+            vit=vit_config,
+            distillation=distillation_config,
             **{k: v for k, v in raw_config.items()
-               if k not in ['data', 'model', 'training', 'logging']}
+               if k not in ['data', 'model', 'training', 'logging', 'vit', 'distillation']}
         )
 
         ConfigManager.validate_config(config)
@@ -119,6 +204,11 @@ class ConfigManager:
         valid_datasets = ['mnist', 'cifar', 'custom']
         if config.data.dataset not in valid_datasets:
             raise ValueError(f"Invalid dataset: {config.data.dataset}")
+
+        # Validate model type
+        valid_model_types = ['adaptive_cnn', 'deit']
+        if config.model.model_type not in valid_model_types:
+            raise ValueError(f"Invalid model_type: {config.model.model_type}")
 
         if config.data.batch_size <= 0:
             raise ValueError("Batch size must be positive")
@@ -155,6 +245,12 @@ class ConfigManager:
             'device': config.device,
             'output_dir': config.output_dir
         }
+
+        # Include optional vit and distillation configs
+        if config.vit is not None:
+            config_dict['vit'] = config.vit.__dict__
+        if config.distillation is not None:
+            config_dict['distillation'] = config.distillation.__dict__
 
         if save_path.suffix in ['.yml', '.yaml']:
             with open(save_path, 'w') as f:

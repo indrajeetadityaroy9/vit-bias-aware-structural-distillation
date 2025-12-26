@@ -7,7 +7,7 @@ data:
     auto_augment: true         # ENABLED - powerful learned augmentation policy
     cutmix: true               # ENABLED - better than mixup for CIFAR
     cutmix_alpha: 1.0          # Standard alpha for beta distribution
-  batch_size: 512
+  batch_size: 2048  # H100 optimized - 2x larger for faster training
   data_path: ./data
   dataset: cifar
   normalization:
@@ -41,26 +41,32 @@ model:
   model_type: adaptive_cnn
   num_classes: 10
   use_se: true
-output_dir: ./outputs
+output_dir: ./outputs/cifar_improved
 seed: 42
 training:
   amp_backend: native
   early_stopping: true
   early_stopping_min_delta: 0.0005   # REDUCED - more sensitive to improvements
-  early_stopping_patience: 30        # INCREASED from 10 - allow longer plateaus
+  early_stopping_patience: 15        # Reduced for faster training
   gradient_accumulation_steps: 1
   gradient_clip_val: 1.0
   label_smoothing: 0.1               # Works well with CutMix
-  learning_rate: 0.2
+  learning_rate: 0.8                 # Scaled 2x for batch_size 2048
   lr_scheduler_params:
-    T_max: 100
+    T_max: 40
     eta_min: 0.00001                 # REDUCED - allow finer tuning at end
-  num_epochs: 100
+  num_epochs: 40
   optimizer: sgd
   scheduler: cosine
   swa_lr: 0.0005
-  swa_start_epoch: 0.75              # SWA starts at epoch 150
+  swa_start_epoch: 0.75              # SWA starts at epoch 75
   use_amp: true
   use_swa: true
-  warmup_epochs: 10
+  warmup_epochs: 5
   weight_decay: 0.0005
+  # H100 optimizations
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true

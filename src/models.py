@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
+from src.vit import DeiT
+
 logger = logging.getLogger(__name__)
 
 class SEBlock(nn.Module):
@@ -62,9 +64,9 @@ class AdaptiveCNN(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.in_channels = config['in_channels']
-        self.num_classes = config['num_classes']
-        self.dataset = config['dataset']
+        self.in_channels = config.get('in_channels', 3)
+        self.num_classes = config.get('num_classes', 10)
+        self.dataset = config.get('dataset', 'custom')
         self.use_se = config.get('use_se', True)
 
         if self.dataset == 'mnist':
@@ -212,6 +214,7 @@ class ModelFactory:
 
     _models = {
         'adaptive_cnn': AdaptiveCNN,
+        'deit': DeiT,
     }
 
     @classmethod
