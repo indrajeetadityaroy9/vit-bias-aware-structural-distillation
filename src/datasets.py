@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 from torchvision import datasets, transforms
 import numpy as np
 import logging
@@ -504,6 +504,8 @@ class DatasetManager:
         Create data loaders for dual-path augmentation training.
 
         Returns train_loader that yields (clean_imgs, augmented_imgs, targets).
+        Returns val_loader that yields standard (img, target) 2-tuples for compatibility
+        with DDPTrainer.validate_ddp().
 
         Args:
             config: Configuration object
@@ -515,14 +517,24 @@ class DatasetManager:
         # Get dual augment training dataset
         full_train_dataset = DatasetManager.get_dual_augment_dataset(config)
 
-        # Split into train/val
-        train_size = int((1 - val_split) * len(full_train_dataset))
-        val_size = len(full_train_dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            full_train_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(config.seed)
-        )
+        # Split into train/val indices
+        total_size = len(full_train_dataset)
+        train_size = int((1 - val_split) * total_size)
+        val_size = total_size - train_size
+
+        # Generate consistent indices using seeded generator
+        generator = torch.Generator().manual_seed(config.seed)
+        indices = torch.randperm(total_size, generator=generator).tolist()
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+
+        # Train dataset uses DualAugment (3-tuple: clean, augmented, target)
+        train_dataset = Subset(full_train_dataset, train_indices)
+
+        # Validation dataset uses standard single-path transform (2-tuple: img, target)
+        # This ensures compatibility with DDPTrainer.validate_ddp()
+        standard_train_dataset = DatasetManager.get_dataset(config, is_train=False)
+        val_dataset = Subset(standard_train_dataset, val_indices)
 
         # Test dataset uses standard single-path transform
         test_dataset = DatasetManager.get_dataset(config, is_train=False)
@@ -538,7 +550,7 @@ class DatasetManager:
             drop_last=True
         )
 
-        # Validation uses clean transform only (single path)
+        # Validation uses standard 2-tuple format (img, target) for DDPTrainer compatibility
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.data.batch_size,
@@ -558,8 +570,8 @@ class DatasetManager:
         )
 
         logger.info(
-            f"Created dual-augment data loaders - Train: {len(train_dataset)}, "
-            f"Val: {len(val_dataset)}, Test: {len(test_dataset)}"
+            f"Created dual-augment data loaders - Train: {len(train_dataset)} (3-tuple), "
+            f"Val: {len(val_dataset)} (2-tuple), Test: {len(test_dataset)}"
         )
 
         return train_loader, val_loader, test_loader

@@ -53,7 +53,13 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility."""
+    """
+    Set random seeds for partial reproducibility.
+
+    Note: cuDNN benchmark=True and deterministic=False are set for training speed.
+    This means runs are NOT fully deterministic but benefit from faster kernel selection.
+    For strict reproducibility, set benchmark=False and deterministic=True.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -165,13 +171,21 @@ def create_distributed_dataloaders(
         shuffle=False
     )
 
+    # Worker init function for reproducible augmentation in multi-worker DataLoader
+    def worker_init_fn(worker_id):
+        """Seed each worker with unique but deterministic seed."""
+        worker_seed = config.seed + rank * 1000 + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     # DataLoader kwargs
     loader_kwargs = {
         'batch_size': config.data.batch_size,
         'num_workers': config.data.num_workers,
         'pin_memory': config.data.pin_memory,
         'persistent_workers': config.data.persistent_workers and config.data.num_workers > 0,
-        'prefetch_factor': config.data.prefetch_factor if config.data.num_workers > 0 else 2
+        'prefetch_factor': config.data.prefetch_factor if config.data.num_workers > 0 else 2,
+        'worker_init_fn': worker_init_fn if config.data.num_workers > 0 else None
     }
 
     train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)

@@ -262,6 +262,12 @@ class DistillationTrainer(DDPTrainer):
 
                     loss = loss / self.grad_accum_steps
 
+                # Check for NaN/Inf loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 if self.scaler is not None:
                     # FP16 with GradScaler
                     self.scaler.scale(loss).backward()
@@ -786,17 +792,19 @@ class TokenCorrelationLoss(nn.Module):
             teacher_corr = torch.bmm(teacher_norm, teacher_norm.transpose(1, 2))
 
         # Apply temperature and normalize
-        student_prob = F.softmax(student_corr / self.temperature, dim=-1)
+        # Use log_softmax for student (numerically stable) and softmax for teacher
+        student_log_prob = F.log_softmax(student_corr / self.temperature, dim=-1)
         teacher_prob = F.softmax(teacher_corr / self.temperature, dim=-1)
 
         if self.loss_type == 'kl':
             # KL divergence (more stable for probability matrices)
             loss = F.kl_div(
-                student_prob.log(),
+                student_log_prob,
                 teacher_prob,
                 reduction='batchmean'
             )
         else:  # frobenius
+            student_prob = F.softmax(student_corr / self.temperature, dim=-1)
             loss = torch.norm(student_prob - teacher_prob, p='fro') / student_prob.numel()
 
         return loss
@@ -1720,6 +1728,12 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
                     loss = loss / self.grad_accum_steps
 
+                # Check for NaN/Inf loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 # Backward pass
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
@@ -1765,6 +1779,13 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                 )
 
                 loss = loss / self.grad_accum_steps
+
+                # Check for NaN/Inf loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 loss.backward()
 
                 if (batch_idx + 1) % self.grad_accum_steps == 0:

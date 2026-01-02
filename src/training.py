@@ -8,6 +8,8 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 from collections import defaultdict
+import random
+import numpy as np
 from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig, ViTConfig, DistillationConfig
 
 logger = logging.getLogger(__name__)
@@ -145,6 +147,14 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
         'metrics_history': dict(metrics_history)
     }
 
+    # Save RNG states for reproducible resume
+    checkpoint['rng_state'] = {
+        'torch': torch.get_rng_state(),
+        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'numpy': np.random.get_state(),
+        'python': random.getstate()
+    }
+
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
@@ -158,6 +168,34 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
         checkpoint.update(extra_metadata)
 
     return checkpoint
+
+
+def restore_rng_state(checkpoint):
+    """
+    Restore RNG states from checkpoint for reproducible resume.
+
+    Args:
+        checkpoint: Checkpoint dictionary with 'rng_state' key
+    """
+    if 'rng_state' not in checkpoint:
+        logger.warning("Checkpoint does not contain RNG state - resume may not be reproducible")
+        return
+
+    rng_state = checkpoint['rng_state']
+
+    if 'torch' in rng_state:
+        torch.set_rng_state(rng_state['torch'])
+
+    if 'torch_cuda' in rng_state and rng_state['torch_cuda'] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
+
+    if 'numpy' in rng_state:
+        np.random.set_state(rng_state['numpy'])
+
+    if 'python' in rng_state:
+        random.setstate(rng_state['python'])
+
+    logger.info("Restored RNG state from checkpoint")
 
 
 class EarlyStopping:
@@ -400,6 +438,12 @@ class DDPTrainer(Trainer):
                     loss = self.criterion(outputs, targets)
                     loss = loss / self.grad_accum_steps
 
+                # Check for NaN/Inf loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 if self.scaler is not None:
                     # FP16 with GradScaler
                     self.scaler.scale(loss).backward()
@@ -432,6 +476,13 @@ class DDPTrainer(Trainer):
                 outputs = self.ddp_model(inputs)
                 loss = self.criterion(outputs, targets)
                 loss = loss / self.grad_accum_steps
+
+                # Check for NaN/Inf loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
+                    self.optimizer.zero_grad()
+                    continue
+
                 loss.backward()
 
                 if (batch_idx + 1) % self.grad_accum_steps == 0:
