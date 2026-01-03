@@ -341,6 +341,8 @@ class DatasetManager:
 
         test_dataset = DatasetManager.get_dataset(config, is_train=False)
 
+        # H100 optimization: use config drop_last for CUDA Graphs compatibility
+        drop_last = getattr(config.data, 'drop_last', True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.data.batch_size,
@@ -349,7 +351,7 @@ class DatasetManager:
             pin_memory=config.data.pin_memory,
             persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
             prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
-            drop_last=True
+            drop_last=drop_last
         )
 
         val_loader = DataLoader(
@@ -539,6 +541,8 @@ class DatasetManager:
         # Test dataset uses standard single-path transform
         test_dataset = DatasetManager.get_dataset(config, is_train=False)
 
+        # H100 optimization: use config drop_last for CUDA Graphs compatibility
+        drop_last = getattr(config.data, 'drop_last', True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.data.batch_size,
@@ -547,7 +551,7 @@ class DatasetManager:
             pin_memory=config.data.pin_memory,
             persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
             prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
-            drop_last=True
+            drop_last=drop_last
         )
 
         # Validation uses standard 2-tuple format (img, target) for DDPTrainer compatibility

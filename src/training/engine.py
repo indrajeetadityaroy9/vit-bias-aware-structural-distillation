@@ -1,264 +1,47 @@
+"""
+Training engines for standard and distributed training.
+
+Provides:
+- Trainer: Single-GPU training loop
+- DDPTrainer: Multi-GPU DDP training loop
+"""
+
+import time
+import logging
+from pathlib import Path
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from torch.optim.swa_utils import AveragedModel, SWALR
-import logging
-from pathlib import Path
 from tqdm import tqdm
-import time
-from collections import defaultdict
-import random
-import numpy as np
-from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig, ViTConfig, DistillationConfig
+
+from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig
+
+from .components import EarlyStopping, LabelSmoothingCrossEntropy
+from .optimizers import build_optimizer, build_scheduler, HAS_PYTORCH_2, HAS_PYTORCH_2_1
+from .checkpointing import build_checkpoint_dict, restore_rng_state
 
 logger = logging.getLogger(__name__)
 
-# Check PyTorch version for H100 optimizations
-PYTORCH_VERSION = tuple(int(x) for x in torch.__version__.split('.')[:2])
-HAS_PYTORCH_2 = PYTORCH_VERSION >= (2, 0)
-HAS_PYTORCH_2_1 = PYTORCH_VERSION >= (2, 1)
-
-
-# =============================================================================
-# Utility Functions (Shared across all trainers)
-# =============================================================================
-
-def build_optimizer(model, config, device):
-    """
-    Create optimizer with H100 optimizations.
-
-    Args:
-        model: PyTorch model (unwrapped)
-        config: Config object with training settings
-        device: Target device
-
-    Returns:
-        Configured optimizer
-    """
-    opt_name = config.training.optimizer.lower()
-    lr = config.training.learning_rate
-    wd = config.training.weight_decay
-
-    # Fused optimizers require PyTorch 2.0+ and CUDA
-    use_fused = (config.training.use_fused_optimizer and
-                 device.type == 'cuda' and HAS_PYTORCH_2)
-
-    if not HAS_PYTORCH_2 and config.training.use_fused_optimizer:
-        logger.warning("Fused optimizers require PyTorch 2.0+. Using standard optimizers.")
-
-    if opt_name == 'adam':
-        return optim.Adam(model.parameters(), lr=lr, weight_decay=wd, fused=use_fused)
-    elif opt_name == 'adamw':
-        if use_fused:
-            logger.info("Using fused AdamW optimizer (H100 optimized)")
-        return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, fused=use_fused)
-    elif opt_name == 'sgd':
-        if use_fused:
-            logger.info("Using fused SGD optimizer (H100 optimized)")
-        return optim.SGD(model.parameters(), lr=lr, weight_decay=wd,
-                         momentum=0.9, nesterov=True, fused=use_fused)
-    elif opt_name == 'rmsprop':
-        return optim.RMSprop(model.parameters(), lr=lr, weight_decay=wd)
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_name}")
-
-
-def build_scheduler(optimizer, config):
-    """
-    Create learning rate scheduler.
-
-    Args:
-        optimizer: PyTorch optimizer
-        config: Config object with training settings
-
-    Returns:
-        Configured scheduler or None
-    """
-    scheduler_name = config.training.scheduler.lower()
-    params = config.training.lr_scheduler_params
-
-    if scheduler_name == 'step':
-        return optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=params.get('step_size', 10),
-            gamma=params.get('gamma', 0.1)
-        )
-    elif scheduler_name == 'cosine':
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=params.get('T_max', config.training.num_epochs),
-            eta_min=params.get('eta_min', 0.0001)
-        )
-    elif scheduler_name == 'plateau':
-        return optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=params.get('factor', 0.1),
-            patience=params.get('patience', 5),
-            min_lr=params.get('min_lr', 1e-7)
-        )
-    elif scheduler_name == 'exponential':
-        return optim.lr_scheduler.ExponentialLR(
-            optimizer,
-            gamma=params.get('gamma', 0.95)
-        )
-    elif scheduler_name == 'cyclic':
-        return optim.lr_scheduler.CyclicLR(
-            optimizer,
-            base_lr=params.get('base_lr', 0.0001),
-            max_lr=params.get('max_lr', config.training.learning_rate),
-            step_size_up=params.get('step_size_up', 2000),
-            mode=params.get('mode', 'triangular2')
-        )
-    else:
-        return None
-
-
-def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
-                          epoch, metrics, config, best_val_acc, metrics_history,
-                          extra_metadata=None):
-    """
-    Build checkpoint dictionary with all training state.
-
-    Args:
-        model: PyTorch model (unwrapped from DDP)
-        optimizer: Optimizer
-        scheduler: LR scheduler (optional)
-        scaler: GradScaler (optional)
-        swa_model: SWA model (optional)
-        epoch: Current epoch
-        metrics: Current metrics dict
-        config: Config object
-        best_val_acc: Best validation accuracy
-        metrics_history: Training history
-        extra_metadata: Additional distillation-specific metadata (optional)
-
-    Returns:
-        Checkpoint dictionary
-    """
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': metrics,
-        'config': config,
-        'best_val_acc': best_val_acc,
-        'metrics_history': dict(metrics_history)
-    }
-
-    # Save RNG states for reproducible resume
-    checkpoint['rng_state'] = {
-        'torch': torch.get_rng_state(),
-        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        'numpy': np.random.get_state(),
-        'python': random.getstate()
-    }
-
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-
-    if scaler is not None:
-        checkpoint['scaler_state_dict'] = scaler.state_dict()
-
-    if swa_model is not None:
-        checkpoint['swa_model_state_dict'] = swa_model.state_dict()
-
-    if extra_metadata is not None:
-        checkpoint.update(extra_metadata)
-
-    return checkpoint
-
-
-def restore_rng_state(checkpoint):
-    """
-    Restore RNG states from checkpoint for reproducible resume.
-
-    Args:
-        checkpoint: Checkpoint dictionary with 'rng_state' key
-    """
-    if 'rng_state' not in checkpoint:
-        logger.warning("Checkpoint does not contain RNG state - resume may not be reproducible")
-        return
-
-    rng_state = checkpoint['rng_state']
-
-    if 'torch' in rng_state:
-        torch.set_rng_state(rng_state['torch'])
-
-    if 'torch_cuda' in rng_state and rng_state['torch_cuda'] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
-
-    if 'numpy' in rng_state:
-        np.random.set_state(rng_state['numpy'])
-
-    if 'python' in rng_state:
-        random.setstate(rng_state['python'])
-
-    logger.info("Restored RNG state from checkpoint")
-
-
-class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.001, mode='min'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-
-    def __call__(self, metric):
-        if self.mode == 'min':
-            score = -metric
-        else:
-            score = metric
-
-        if self.best_score is None:
-            self.best_score = score
-        elif score < self.best_score + self.min_delta:
-            self.counter += 1
-            logger.info(f'EarlyStopping counter: {self.counter}/{self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.counter = 0
-
-        return self.early_stop
-
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super().__init__()
-        self.smoothing = smoothing
-
-    def forward(self, pred, target):
-        n_classes = pred.size(-1)
-        log_pred = torch.log_softmax(pred, dim=-1)
-
-        # Handle soft labels (from CutMix/MixUp) - target is [batch, num_classes] float
-        if target.dim() > 1 and target.size(-1) == n_classes:
-            # Soft labels: use KL divergence style loss
-            loss = -(target * log_pred).sum(dim=-1)
-            return loss.mean()
-
-        # Handle hard labels (integer indices) - original behavior
-        loss = -log_pred.sum(dim=-1)
-        nll = -log_pred.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
-        smooth_loss = loss / n_classes
-        loss = (1 - self.smoothing) * nll + self.smoothing * smooth_loss
-        return loss.mean()
 
 class Trainer:
+    """Single-GPU trainer with H100 optimizations."""
+
     def __init__(self, model, config, device):
         self.model = model
         self.config = config
         self.device = device
 
         # Enable TF32 for H100 (and other Ampere+ GPUs)
+        # This provides ~3x speedup on matrix multiplications
         if config.training.use_tf32 and device.type == 'cuda':
+            torch.set_float32_matmul_precision('high')  # 'high' for speed, 'highest' for precision
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            logger.info("TF32 enabled for matmul and cuDNN operations")
+            logger.info("TF32 enabled: matmul precision='high', cuDNN TF32=True")
 
         if config.training.label_smoothing > 0:
             self.criterion = LabelSmoothingCrossEntropy(config.training.label_smoothing)
@@ -275,11 +58,9 @@ class Trainer:
         if self.use_amp:
             # Use BF16 for better numerical stability on H100
             if config.training.use_bf16:
-                # BF16 has same exponent range as FP32, so GradScaler is not needed
                 self.autocast_kwargs = {'device_type': 'cuda', 'dtype': torch.bfloat16}
                 logger.info("Using BF16 mixed precision (H100 optimized) - GradScaler disabled")
             else:
-                # FP16 needs GradScaler for numerical stability
                 self.scaler = GradScaler()
                 self.autocast_kwargs = {'device_type': 'cuda'}
                 logger.info("Using FP16 mixed precision with GradScaler")
@@ -354,6 +135,7 @@ class Trainer:
         logger.info(f"Checkpoint saved to {save_path}")
 
     def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint and restore training state."""
         if hasattr(torch.serialization, 'add_safe_globals'):
             torch.serialization.add_safe_globals([
                 Config,
@@ -384,6 +166,8 @@ class Trainer:
 
 
 class DDPTrainer(Trainer):
+    """Multi-GPU DDP trainer with H100 optimizations."""
+
     def __init__(self, model, config, device, rank, world_size):
         super().__init__(model.module if hasattr(model, 'module') else model, config, device)
 
@@ -414,7 +198,7 @@ class DDPTrainer(Trainer):
         return False
 
     def train_epoch_ddp(self, train_loader, train_sampler):
-        # Set epoch for distributed sampler (different shuffle each epoch)
+        """Train one epoch with DDP."""
         train_sampler.set_epoch(self.current_epoch)
 
         self.ddp_model.train()
@@ -423,7 +207,6 @@ class DDPTrainer(Trainer):
         total = 0
         batch_count = 0
 
-        # Only show progress bar on rank 0
         if self.is_main_process:
             pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}")
         else:
@@ -438,14 +221,12 @@ class DDPTrainer(Trainer):
                     loss = self.criterion(outputs, targets)
                     loss = loss / self.grad_accum_steps
 
-                # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 if self.scaler is not None:
-                    # FP16 with GradScaler
                     self.scaler.scale(loss).backward()
 
                     if (batch_idx + 1) % self.grad_accum_steps == 0:
@@ -458,9 +239,8 @@ class DDPTrainer(Trainer):
 
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
                 else:
-                    # BF16 without GradScaler
                     loss.backward()
 
                     if (batch_idx + 1) % self.grad_accum_steps == 0:
@@ -471,16 +251,15 @@ class DDPTrainer(Trainer):
                             )
 
                         self.optimizer.step()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
             else:
                 outputs = self.ddp_model(inputs)
                 loss = self.criterion(outputs, targets)
                 loss = loss / self.grad_accum_steps
 
-                # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 loss.backward()
@@ -493,12 +272,11 @@ class DDPTrainer(Trainer):
                         )
 
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * self.grad_accum_steps
             _, predicted = outputs.max(1)
 
-            # Handle one-hot encoded targets
             if len(targets.shape) > 1:
                 targets = targets.argmax(1)
 
@@ -535,6 +313,7 @@ class DDPTrainer(Trainer):
 
     @torch.no_grad()
     def validate_ddp(self, val_loader):
+        """Validate with DDP."""
         self.ddp_model.eval()
         total_loss = 0
         correct = 0
@@ -549,7 +328,6 @@ class DDPTrainer(Trainer):
             total_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
 
-            # Handle one-hot encoded targets
             if len(targets.shape) > 1:
                 targets = targets.argmax(1)
 
@@ -576,6 +354,7 @@ class DDPTrainer(Trainer):
         return metrics
 
     def train_ddp(self, train_loader, train_sampler, val_loader, num_epochs=None):
+        """Full DDP training loop."""
         num_epochs = num_epochs or self.config.training.num_epochs
 
         if self.is_main_process:
@@ -654,3 +433,6 @@ class DDPTrainer(Trainer):
             logger.info("DDP training completed")
 
         return dict(self.metrics_history)
+
+
+__all__ = ['Trainer', 'DDPTrainer']

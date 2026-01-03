@@ -1,104 +1,29 @@
 """
-Knowledge Distillation for DeiT (Data-efficient Image Transformer).
+Distillation training engines.
 
-Implements distillation training where a Vision Transformer (student) learns from
-a pre-trained CNN (teacher) using a distillation token.
-
-Based on: "Training data-efficient image transformers & distillation through attention"
-(Touvron et al., 2021)
+Provides:
+- DistillationTrainer: DeiT-style CNN→ViT distillation
+- SelfSupervisedDistillationTrainer: CST-style DINO→ViT distillation
 """
+
+import math
+import time
+import logging
+import numpy as np
+from pathlib import Path
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast
-import logging
-from pathlib import Path
 from tqdm import tqdm
-import time
-from collections import defaultdict
 
-from src.training import DDPTrainer, LabelSmoothingCrossEntropy, build_checkpoint_dict
-from src.config import (
-    Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
-    ViTConfig, DistillationConfig
-)
+from src.training import DDPTrainer, build_checkpoint_dict
+
+from .losses import DistillationLoss, SelfSupervisedDistillationLoss
 
 logger = logging.getLogger(__name__)
-
-
-class DistillationLoss(nn.Module):
-    """
-    Combined loss for DeiT distillation training.
-
-    Supports two distillation modes:
-    1. Hard distillation (default): Uses argmax of teacher predictions
-       loss = (1-alpha)*CE(cls_out, targets) + alpha*CE(dist_out, argmax(teacher))
-
-    2. Soft distillation: Uses temperature-scaled KL divergence
-       loss = (1-alpha)*CE(cls_out, targets) + alpha*tau^2*KL(dist_out/tau, teacher/tau)
-
-    Args:
-        base_criterion: Loss function for ground truth (e.g., LabelSmoothingCrossEntropy)
-        distillation_type: 'hard' or 'soft'
-        alpha: Weight for distillation loss (0 = no distillation, 1 = only distillation)
-        tau: Temperature for soft distillation
-    """
-
-    def __init__(self, base_criterion, distillation_type='hard', alpha=0.5, tau=3.0):
-        super().__init__()
-        self.base_criterion = base_criterion
-        self.distillation_type = distillation_type
-
-        # Validate alpha is in [0, 1]
-        if not 0 <= alpha <= 1:
-            raise ValueError(f"Distillation alpha must be between 0 and 1, got {alpha}")
-        self.alpha = alpha
-
-        # Validate tau is positive (for soft distillation)
-        if tau <= 0:
-            raise ValueError(f"Distillation tau must be positive, got {tau}")
-        self.tau = tau
-
-    def forward(self, student_cls_output, student_dist_output, targets, teacher_output):
-        """
-        Compute distillation loss.
-
-        Args:
-            student_cls_output: Student [CLS] token predictions (B, num_classes)
-            student_dist_output: Student [DIST] token predictions (B, num_classes)
-            targets: Ground truth labels (B,) or (B, num_classes) for soft labels
-            teacher_output: Teacher model predictions (B, num_classes)
-
-        Returns:
-            total_loss: Combined loss
-            loss_dict: Dictionary with individual loss components
-        """
-        # Ground truth loss on [CLS] token
-        cls_loss = self.base_criterion(student_cls_output, targets)
-
-        if self.distillation_type == 'hard':
-            # Hard labels from teacher (argmax)
-            teacher_labels = teacher_output.argmax(dim=1)
-            dist_loss = F.cross_entropy(student_dist_output, teacher_labels)
-        else:
-            # Soft distillation with temperature scaling
-            soft_teacher = F.softmax(teacher_output / self.tau, dim=1)
-            soft_student = F.log_softmax(student_dist_output / self.tau, dim=1)
-            dist_loss = F.kl_div(soft_student, soft_teacher, reduction='batchmean')
-            # Scale by tau^2 as per Hinton et al.
-            dist_loss = dist_loss * (self.tau ** 2)
-
-        # Combined loss
-        total_loss = (1 - self.alpha) * cls_loss + self.alpha * dist_loss
-
-        loss_dict = {
-            'cls_loss': cls_loss.item(),
-            'dist_loss': dist_loss.item(),
-            'total_loss': total_loss.item()
-        }
-
-        return total_loss, loss_dict
 
 
 class DistillationTrainer(DDPTrainer):
@@ -183,7 +108,6 @@ class DistillationTrainer(DDPTrainer):
             return self.alpha_start + (self.alpha_end - self.alpha_start) * progress
         elif self.alpha_schedule == 'cosine':
             # Cosine annealing from alpha_start to alpha_end
-            import math
             return self.alpha_start + (self.alpha_end - self.alpha_start) * (1 - math.cos(progress * math.pi)) / 2
         else:
             return self.distillation_alpha
@@ -265,7 +189,7 @@ class DistillationTrainer(DDPTrainer):
                 # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 if self.scaler is not None:
@@ -281,7 +205,7 @@ class DistillationTrainer(DDPTrainer):
                             )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
                 else:
                     # BF16 without GradScaler
                     loss.backward()
@@ -293,7 +217,7 @@ class DistillationTrainer(DDPTrainer):
                                 self.config.training.gradient_clip_val
                             )
                         self.optimizer.step()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
             else:
                 # Non-AMP path
                 student_output = self.ddp_model(inputs)
@@ -328,7 +252,7 @@ class DistillationTrainer(DDPTrainer):
                             self.config.training.gradient_clip_val
                         )
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
             # Track metrics
             total_loss += loss.item() * self.grad_accum_steps
@@ -475,9 +399,7 @@ class DistillationTrainer(DDPTrainer):
         return metrics
 
     def train_ddp(self, train_loader, train_sampler, val_loader, num_epochs=None):
-        """
-        Full distillation training loop.
-        """
+        """Full distillation training loop."""
         num_epochs = num_epochs or self.config.training.num_epochs
 
         if self.is_main_process:
@@ -602,734 +524,6 @@ class DistillationTrainer(DDPTrainer):
         save_path = checkpoint_dir / filename
         torch.save(checkpoint, save_path)
         logger.info(f"Checkpoint saved to {save_path}")
-
-
-# =============================================================================
-# Self-Supervised Token Correlation Distillation (CST-style)
-# =============================================================================
-
-def load_dino_teacher(teacher_type, model_name, device):
-    """
-    Load a pretrained DINO/DINOv2 model as teacher.
-
-    Args:
-        teacher_type: 'dino' or 'dinov2'
-        model_name: Model identifier (e.g., 'dinov2_vits14', 'dino_vits16')
-        device: Target device
-
-    Returns:
-        teacher_model: Frozen pretrained ViT teacher
-        embed_dim: Teacher embedding dimension
-    """
-    # Embedding dimension lookup
-    embed_dim_map = {
-        # DINOv2 models
-        'dinov2_vits14': 384,
-        'dinov2_vitb14': 768,
-        'dinov2_vitl14': 1024,
-        'dinov2_vitg14': 1536,
-        # DINO models
-        'dino_vits16': 384,
-        'dino_vits8': 384,
-        'dino_vitb16': 768,
-        'dino_vitb8': 768,
-    }
-
-    if teacher_type == 'dinov2':
-        logger.info(f"Loading DINOv2 teacher: {model_name}")
-        teacher_model = torch.hub.load('facebookresearch/dinov2', model_name)
-    elif teacher_type == 'dino':
-        logger.info(f"Loading DINO teacher: {model_name}")
-        teacher_model = torch.hub.load('facebookresearch/dino:main', model_name)
-    else:
-        raise ValueError(f"Unknown teacher_type: {teacher_type}. Use 'dino' or 'dinov2'.")
-
-    embed_dim = embed_dim_map.get(model_name, 384)
-
-    # Freeze teacher
-    teacher_model = teacher_model.to(device)
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-
-    logger.info(f"Loaded {teacher_type} teacher: {model_name} (embed_dim={embed_dim}, frozen)")
-    return teacher_model, embed_dim
-
-
-class ProjectionHead(nn.Module):
-    """
-    Learnable projection head to align student/teacher embedding dimensions.
-
-    Architecture: Linear -> LayerNorm -> GELU -> Linear -> LayerNorm
-    This stabilizes cosine similarity and allows dimension mismatch handling.
-    """
-
-    def __init__(self, in_dim, out_dim, hidden_dim=None):
-        super().__init__()
-        hidden_dim = hidden_dim or out_dim * 2
-
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-            nn.LayerNorm(out_dim)
-        )
-
-    def forward(self, x):
-        return self.proj(x)
-
-
-class TokenRepresentationLoss(nn.Module):
-    """
-    Token representation distillation loss (L_tok) - PRIMARY SIGNAL.
-
-    Matches intermediate layer embeddings between teacher and student
-    using learnable projection heads for dimension alignment.
-    """
-
-    def __init__(self, student_dim, teacher_dim, projection_dim, num_layers, loss_type='cosine'):
-        super().__init__()
-        self.loss_type = loss_type
-        self.num_layers = num_layers
-
-        # Separate projectors per layer - allows layer-specific alignment
-        self.student_projectors = nn.ModuleList([
-            ProjectionHead(student_dim, projection_dim)
-            for _ in range(num_layers)
-        ])
-        self.teacher_projectors = nn.ModuleList([
-            ProjectionHead(teacher_dim, projection_dim)
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, student_intermediates, teacher_intermediates, layer_indices):
-        """
-        Compute token representation loss.
-
-        Args:
-            student_intermediates: Dict[layer_idx] -> (B, N_s, d_s)
-            teacher_intermediates: Dict[layer_idx] -> (B, N_s, d_t) - already interpolated
-            layer_indices: List of layer indices
-
-        Returns:
-            loss: Scalar loss value
-            loss_dict: Per-layer losses
-        """
-        total_loss = 0.0
-        loss_dict = {}
-
-        for i, layer_idx in enumerate(layer_indices):
-            student_tokens = student_intermediates[layer_idx]  # (B, N, d_s)
-            teacher_tokens = teacher_intermediates[layer_idx]  # (B, N, d_t)
-
-            # Project to common space
-            proj_student = self.student_projectors[i](student_tokens)  # (B, N, proj_dim)
-            proj_teacher = self.teacher_projectors[i](teacher_tokens)  # (B, N, proj_dim)
-
-            # Compute loss
-            if self.loss_type == 'cosine':
-                # Negative cosine similarity (minimize = maximize similarity)
-                proj_student_norm = F.normalize(proj_student, dim=-1)
-                proj_teacher_norm = F.normalize(proj_teacher, dim=-1)
-                layer_loss = 1 - (proj_student_norm * proj_teacher_norm).sum(dim=-1).mean()
-            else:  # mse
-                layer_loss = F.mse_loss(proj_student, proj_teacher)
-
-            total_loss += layer_loss
-            loss_dict[f'tok_loss_layer_{layer_idx}'] = layer_loss.item()
-
-        # Average over layers
-        total_loss = total_loss / len(layer_indices)
-        loss_dict['tok_loss_total'] = total_loss.item()
-
-        return total_loss, loss_dict
-
-
-class TokenCorrelationLoss(nn.Module):
-    """
-    Token correlation distillation loss (L_rel) - LIGHTWEIGHT REGULARIZER.
-
-    Matches token-token correlation matrices between teacher and student
-    for structural consistency. Uses patch-mean pooling to avoid O(N²) cost.
-    """
-
-    def __init__(self, temperature=0.1, loss_type='kl', use_pooled=True):
-        super().__init__()
-        self.temperature = temperature
-        self.loss_type = loss_type
-        self.use_pooled = use_pooled
-
-    def forward(self, student_tokens, teacher_tokens):
-        """
-        Compute token correlation loss.
-
-        Args:
-            student_tokens: (B, N_s, d_s) patch tokens from student
-            teacher_tokens: (B, N_t, d_t) patch tokens from teacher
-
-        Returns:
-            loss: Scalar loss value
-        """
-        if self.use_pooled:
-            # Patch-mean pooling: (B, N, D) → (B, D) - avoids N² correlation matrix
-            student_pooled = student_tokens.mean(dim=1)  # (B, D)
-            teacher_pooled = teacher_tokens.mean(dim=1)  # (B, D)
-
-            # Compute batch correlation: (B, B) matrix
-            student_norm = F.normalize(student_pooled, dim=-1)
-            teacher_norm = F.normalize(teacher_pooled, dim=-1)
-
-            student_corr = student_norm @ student_norm.T  # (B, B)
-            teacher_corr = teacher_norm @ teacher_norm.T  # (B, B)
-        else:
-            # Full correlation (expensive for large N)
-            student_norm = F.normalize(student_tokens, dim=-1)
-            teacher_norm = F.normalize(teacher_tokens, dim=-1)
-
-            # (B, N, N) correlation matrices
-            student_corr = torch.bmm(student_norm, student_norm.transpose(1, 2))
-            teacher_corr = torch.bmm(teacher_norm, teacher_norm.transpose(1, 2))
-
-        # Apply temperature and normalize
-        # Use log_softmax for student (numerically stable) and softmax for teacher
-        student_log_prob = F.log_softmax(student_corr / self.temperature, dim=-1)
-        teacher_prob = F.softmax(teacher_corr / self.temperature, dim=-1)
-
-        if self.loss_type == 'kl':
-            # KL divergence (more stable for probability matrices)
-            loss = F.kl_div(
-                student_log_prob,
-                teacher_prob,
-                reduction='batchmean'
-            )
-        else:  # frobenius
-            student_prob = F.softmax(student_corr / self.temperature, dim=-1)
-            loss = torch.norm(student_prob - teacher_prob, p='fro') / student_prob.numel()
-
-        return loss
-
-
-class CKALoss(nn.Module):
-    """
-    Centered Kernel Alignment (CKA) Loss for structural distillation.
-
-    CKA measures representational similarity by comparing gram matrices of
-    activations. This captures structural (relational) knowledge rather than
-    just token-wise matching.
-
-    CKA = HSIC(K_S, K_T) / sqrt(HSIC(K_S, K_S) * HSIC(K_T, K_T))
-    Loss = 1 - CKA
-
-    Reference: Kornblith et al., "Similarity of Neural Network Representations
-    Revisited", ICML 2019.
-    """
-
-    def __init__(self, kernel_type='linear', eps=1e-8, normalize_features=True):
-        """
-        Args:
-            kernel_type: 'linear' or 'rbf' kernel for gram matrix computation
-            eps: Small constant for numerical stability
-            normalize_features: If True, L2 normalize features before gram computation
-                              (recommended for numerical stability across batch sizes)
-        """
-        super().__init__()
-        self.kernel_type = kernel_type
-        self.eps = eps
-        self.normalize_features = normalize_features
-
-    def _compute_gram(self, x):
-        """
-        Compute gram matrix (kernel matrix) from feature representations.
-
-        Args:
-            x: Feature tensor (B, N, D) - batch of token sequences
-
-        Returns:
-            K: Gram matrix (B, N, N)
-        """
-        # Optional L2 normalization for numerical stability
-        if self.normalize_features:
-            x = F.normalize(x, p=2, dim=-1)
-
-        if self.kernel_type == 'linear':
-            # Linear kernel: K = X @ X^T
-            K = torch.bmm(x, x.transpose(1, 2))  # (B, N, N)
-        else:  # rbf
-            # RBF kernel: K_ij = exp(-||x_i - x_j||^2 / (2 * sigma^2))
-            # Use median heuristic for sigma
-            x_norm = (x ** 2).sum(-1, keepdim=True)  # (B, N, 1)
-            dist_sq = x_norm + x_norm.transpose(1, 2) - 2 * torch.bmm(x, x.transpose(1, 2))
-            sigma = torch.median(dist_sq.view(-1)).item() + self.eps
-            K = torch.exp(-dist_sq / (2 * sigma))
-        return K
-
-    def _center_gram(self, K):
-        """
-        Center the gram matrix (subtract row/column means).
-
-        Args:
-            K: Gram matrix (B, N, N)
-
-        Returns:
-            K_centered: Centered gram matrix (B, N, N)
-        """
-        B, N, _ = K.shape
-        # Centering matrix: H = I - (1/N) * 1 * 1^T
-        # K_centered = H @ K @ H
-        row_mean = K.mean(dim=2, keepdim=True)  # (B, N, 1)
-        col_mean = K.mean(dim=1, keepdim=True)  # (B, 1, N)
-        total_mean = K.mean(dim=(1, 2), keepdim=True)  # (B, 1, 1)
-
-        K_centered = K - row_mean - col_mean + total_mean
-        return K_centered
-
-    def _hsic(self, K1, K2):
-        """
-        Compute Hilbert-Schmidt Independence Criterion (HSIC).
-
-        HSIC(K1, K2) = (1/(N-1)^2) * trace(K1_centered @ K2_centered)
-
-        Args:
-            K1, K2: Centered gram matrices (B, N, N)
-
-        Returns:
-            hsic: HSIC value (B,)
-        """
-        B, N, _ = K1.shape
-        # trace(K1 @ K2) = sum(K1 * K2^T)
-        hsic = (K1 * K2).sum(dim=(1, 2)) / ((N - 1) ** 2 + self.eps)
-        return hsic
-
-    def _compute_batch_cka(self, student_tokens, teacher_tokens):
-        """
-        Compute batch-wise CKA for CLS-only mode (single token per sample).
-
-        Instead of computing token-token correlations within each sample,
-        compute sample-sample correlations across the batch.
-
-        Args:
-            student_tokens: (B, 1, D_s) - CLS tokens
-            teacher_tokens: (B, 1, D_t) - CLS tokens
-
-        Returns:
-            cka: Scalar CKA similarity
-        """
-        # Squeeze to (B, D)
-        s = student_tokens.squeeze(1)  # (B, D_s)
-        t = teacher_tokens.squeeze(1)  # (B, D_t)
-
-        # L2 normalize for numerical stability
-        if self.normalize_features:
-            s = F.normalize(s, p=2, dim=-1)
-            t = F.normalize(t, p=2, dim=-1)
-
-        # Compute batch gram matrices (B, B)
-        K_s = s @ s.T  # (B, B)
-        K_t = t @ t.T  # (B, B)
-
-        # Center gram matrices
-        B = K_s.shape[0]
-        row_mean_s = K_s.mean(dim=1, keepdim=True)
-        col_mean_s = K_s.mean(dim=0, keepdim=True)
-        total_mean_s = K_s.mean()
-        K_s_centered = K_s - row_mean_s - col_mean_s + total_mean_s
-
-        row_mean_t = K_t.mean(dim=1, keepdim=True)
-        col_mean_t = K_t.mean(dim=0, keepdim=True)
-        total_mean_t = K_t.mean()
-        K_t_centered = K_t - row_mean_t - col_mean_t + total_mean_t
-
-        # Compute HSIC values
-        hsic_st = (K_s_centered * K_t_centered).sum() / ((B - 1) ** 2 + self.eps)
-        hsic_ss = (K_s_centered * K_s_centered).sum() / ((B - 1) ** 2 + self.eps)
-        hsic_tt = (K_t_centered * K_t_centered).sum() / ((B - 1) ** 2 + self.eps)
-
-        # Compute CKA
-        denominator = torch.sqrt(hsic_ss * hsic_tt + self.eps)
-        cka = hsic_st / denominator
-
-        return cka
-
-    def forward(self, student_tokens, teacher_tokens):
-        """
-        Compute CKA loss between student and teacher representations.
-
-        Args:
-            student_tokens: (B, N_s, D_s) student token representations
-            teacher_tokens: (B, N_t, D_t) teacher token representations
-                           (should be interpolated to match N_s)
-
-        Returns:
-            loss: 1 - CKA (minimize to maximize CKA similarity)
-        """
-        B, N, _ = student_tokens.shape
-
-        # CLS-only mode: use batch-wise CKA instead of token-wise
-        if N == 1:
-            cka = self._compute_batch_cka(student_tokens, teacher_tokens)
-            loss = 1.0 - cka
-            return loss
-
-        # Standard token-wise CKA for multiple tokens
-        # Compute gram matrices
-        K_s = self._compute_gram(student_tokens)  # (B, N, N)
-        K_t = self._compute_gram(teacher_tokens)  # (B, N, N)
-
-        # Center gram matrices
-        K_s = self._center_gram(K_s)
-        K_t = self._center_gram(K_t)
-
-        # Compute HSIC values
-        hsic_st = self._hsic(K_s, K_t)  # Cross-similarity
-        hsic_ss = self._hsic(K_s, K_s)  # Student self-similarity
-        hsic_tt = self._hsic(K_t, K_t)  # Teacher self-similarity
-
-        # Compute CKA
-        denominator = torch.sqrt(hsic_ss * hsic_tt + self.eps)
-        cka = hsic_st / denominator  # (B,)
-
-        # Loss = 1 - CKA (minimize to maximize alignment)
-        loss = 1.0 - cka.mean()
-
-        return loss
-
-
-class GramMatrixLoss(nn.Module):
-    """
-    Gram Matrix Loss for structural distillation (ablation baseline).
-
-    Directly compares gram matrices using Frobenius norm.
-    Simpler than CKA but less invariant to affine transformations.
-
-    Loss = ||G_S - G_T||_F / num_elements
-    """
-
-    def __init__(self, normalize=True, eps=1e-8):
-        """
-        Args:
-            normalize: Whether to L2-normalize features before gram computation
-            eps: Small constant for numerical stability
-        """
-        super().__init__()
-        self.normalize = normalize
-        self.eps = eps
-
-    def _compute_gram(self, x):
-        """
-        Compute normalized gram matrix.
-
-        Args:
-            x: Feature tensor (B, N, D)
-
-        Returns:
-            G: Gram matrix (B, N, N)
-        """
-        if self.normalize:
-            x = F.normalize(x, dim=-1)
-        G = torch.bmm(x, x.transpose(1, 2))  # (B, N, N)
-        return G
-
-    def forward(self, student_tokens, teacher_tokens):
-        """
-        Compute gram matrix loss.
-
-        Args:
-            student_tokens: (B, N_s, D_s) student representations
-            teacher_tokens: (B, N_t, D_t) teacher representations
-
-        Returns:
-            loss: Frobenius norm difference between gram matrices
-        """
-        G_s = self._compute_gram(student_tokens)  # (B, N, N)
-        G_t = self._compute_gram(teacher_tokens)  # (B, N, N)
-
-        # Frobenius norm of difference, normalized by number of elements
-        diff = G_s - G_t
-        loss = torch.norm(diff, p='fro', dim=(1, 2))  # (B,)
-        loss = loss / (G_s.shape[1] ** 2)  # Normalize by N^2
-        loss = loss.mean()
-
-        return loss
-
-
-class LayerWiseStructuralLoss(nn.Module):
-    """
-    Layer-wise structural distillation with CKA and optional Gram matrix losses.
-
-    Applies structural loss at multiple intermediate layers with learnable
-    projection heads for dimension alignment.
-    """
-
-    def __init__(self, student_dim, teacher_dim, projection_dim, num_layers,
-                 use_cka=True, use_gram=False, cka_kernel='linear'):
-        """
-        Args:
-            student_dim: Student embedding dimension
-            teacher_dim: Teacher embedding dimension
-            projection_dim: Projection head output dimension
-            num_layers: Number of layers to match
-            use_cka: Whether to use CKA loss
-            use_gram: Whether to use Gram matrix loss (ablation)
-            cka_kernel: 'linear' or 'rbf' kernel for CKA
-        """
-        super().__init__()
-        self.use_cka = use_cka
-        self.use_gram = use_gram
-        self.num_layers = num_layers
-
-        # Projectors for dimension alignment
-        self.student_projectors = nn.ModuleList([
-            ProjectionHead(student_dim, projection_dim)
-            for _ in range(num_layers)
-        ])
-        self.teacher_projectors = nn.ModuleList([
-            ProjectionHead(teacher_dim, projection_dim)
-            for _ in range(num_layers)
-        ])
-
-        # Loss functions
-        if use_cka:
-            self.cka_loss = CKALoss(kernel_type=cka_kernel)
-        if use_gram:
-            self.gram_loss = GramMatrixLoss(normalize=True)
-
-    def forward(self, student_intermediates, teacher_intermediates, layer_indices):
-        """
-        Compute layer-wise structural loss.
-
-        Args:
-            student_intermediates: Dict[layer_idx] -> (B, N_s, D_s)
-            teacher_intermediates: Dict[layer_idx] -> (B, N_s, D_t)
-            layer_indices: List of layer indices
-
-        Returns:
-            loss: Combined structural loss
-            loss_dict: Per-layer and per-loss-type breakdowns
-        """
-        total_cka_loss = 0.0
-        total_gram_loss = 0.0
-        loss_dict = {}
-
-        for i, layer_idx in enumerate(layer_indices):
-            student_tokens = student_intermediates[layer_idx]
-            teacher_tokens = teacher_intermediates[layer_idx]
-
-            # Project to common space
-            proj_student = self.student_projectors[i](student_tokens)
-            proj_teacher = self.teacher_projectors[i](teacher_tokens)
-
-            if self.use_cka:
-                layer_cka = self.cka_loss(proj_student, proj_teacher)
-                total_cka_loss += layer_cka
-                loss_dict[f'cka_loss_layer_{layer_idx}'] = layer_cka.item()
-
-            if self.use_gram:
-                layer_gram = self.gram_loss(proj_student, proj_teacher)
-                total_gram_loss += layer_gram
-                loss_dict[f'gram_loss_layer_{layer_idx}'] = layer_gram.item()
-
-        # Average over layers
-        num_layers = len(layer_indices)
-        if self.use_cka:
-            total_cka_loss = total_cka_loss / num_layers
-            loss_dict['cka_loss_total'] = total_cka_loss.item()
-        if self.use_gram:
-            total_gram_loss = total_gram_loss / num_layers
-            loss_dict['gram_loss_total'] = total_gram_loss.item()
-
-        # Combined loss
-        total_loss = total_cka_loss if self.use_cka else 0.0
-        if self.use_gram:
-            total_loss = total_loss + total_gram_loss
-
-        return total_loss, loss_dict
-
-
-class SelfSupervisedDistillationLoss(nn.Module):
-    """
-    Combined loss for CST-style self-supervised distillation.
-
-    L = L_ce + lambda_tok * L_tok + lambda_rel * L_rel + lambda_cka * L_cka + lambda_gram * L_gram
-
-    Supports staged training:
-    - Stage A (first rel_warmup_epochs): L = L_ce + L_tok
-    - Stage B (remaining epochs): Full loss with L_rel
-    - CKA/Gram losses enabled after cka_warmup_epochs
-
-    Structural losses (CKA, Gram) are the PRIMARY signal for structural distillation
-    experiments. Token losses (L_tok, L_rel) can be disabled when using structural losses.
-    """
-
-    def __init__(self, base_criterion, student_dim, teacher_dim, config):
-        """
-        Args:
-            base_criterion: Base classification loss (e.g., LabelSmoothingCE)
-            student_dim: Student embedding dimension
-            teacher_dim: Teacher embedding dimension
-            config: SelfSupervisedDistillationConfig
-        """
-        super().__init__()
-        self.base_criterion = base_criterion
-        self.config = config
-
-        # Token representation loss - PRIMARY
-        self.token_rep_loss = TokenRepresentationLoss(
-            student_dim=student_dim,
-            teacher_dim=teacher_dim,
-            projection_dim=config.projection_dim,
-            num_layers=len(config.token_layers),
-            loss_type=config.token_loss_type
-        )
-
-        # Token correlation loss - REGULARIZER
-        self.token_corr_loss = TokenCorrelationLoss(
-            temperature=config.correlation_temperature,
-            loss_type=config.correlation_loss_type,
-            use_pooled=config.use_pooled_correlation
-        )
-
-        # CKA structural loss (optional)
-        self.use_cka_loss = getattr(config, 'use_cka_loss', False)
-        if self.use_cka_loss:
-            self.structural_loss = LayerWiseStructuralLoss(
-                student_dim=student_dim,
-                teacher_dim=teacher_dim,
-                projection_dim=config.projection_dim,
-                num_layers=len(config.token_layers),
-                use_cka=True,
-                use_gram=getattr(config, 'use_gram_loss', False),
-                cka_kernel=getattr(config, 'cka_kernel_type', 'linear')
-            )
-            self.lambda_cka = getattr(config, 'lambda_cka', 0.5)
-            self.cka_warmup_epochs = getattr(config, 'cka_warmup_epochs', 5)
-        else:
-            self.structural_loss = None
-            self.lambda_cka = 0.0
-            self.cka_warmup_epochs = 0
-
-        # Gram matrix loss (ablation - standalone without CKA)
-        self.use_gram_loss = getattr(config, 'use_gram_loss', False)
-        if self.use_gram_loss and not self.use_cka_loss:
-            # Gram loss without CKA - create separate loss module
-            self.gram_only_loss = LayerWiseStructuralLoss(
-                student_dim=student_dim,
-                teacher_dim=teacher_dim,
-                projection_dim=config.projection_dim,
-                num_layers=len(config.token_layers),
-                use_cka=False,
-                use_gram=True
-            )
-            self.lambda_gram = getattr(config, 'lambda_gram', 0.5)
-        else:
-            self.gram_only_loss = None
-            self.lambda_gram = getattr(config, 'lambda_gram', 0.5) if self.use_cka_loss else 0.0
-
-        self.lambda_tok = config.lambda_tok
-        self.lambda_rel = config.lambda_rel
-        self.token_layers = config.token_layers
-
-    def get_effective_lambda_rel(self, epoch):
-        """Get effective lambda_rel considering warmup."""
-        if epoch < self.config.rel_warmup_epochs:
-            return 0.0  # Stage A: no correlation loss
-        return self.lambda_rel  # Stage B: add L_rel
-
-    def get_effective_lambda_cka(self, epoch):
-        """Get effective lambda_cka considering warmup."""
-        if not self.use_cka_loss:
-            return 0.0
-        if epoch < self.cka_warmup_epochs:
-            return 0.0
-        return self.lambda_cka
-
-    def forward(self, student_output, targets,
-                student_intermediates, teacher_intermediates,
-                student_patch_tokens, teacher_patch_tokens,
-                epoch):
-        """
-        Compute combined distillation loss.
-
-        Args:
-            student_output: (cls_logits, dist_logits) or cls_logits
-            targets: Ground truth labels
-            student_intermediates: Dict of intermediate student tokens
-            teacher_intermediates: Dict of intermediate teacher tokens
-            student_patch_tokens: Final student patch tokens (B, N, d_s)
-            teacher_patch_tokens: Final teacher patch tokens (B, N, d_t)
-            epoch: Current epoch for staged training
-
-        Returns:
-            total_loss: Combined loss
-            loss_dict: Individual loss components
-        """
-        # Classification loss (on student CLS head ONLY - critical!)
-        if isinstance(student_output, tuple):
-            cls_output, dist_output = student_output
-        else:
-            cls_output = student_output
-
-        ce_loss = self.base_criterion(cls_output, targets)
-
-        # Token representation loss (PRIMARY - always on)
-        tok_loss, tok_loss_dict = self.token_rep_loss(
-            student_intermediates, teacher_intermediates, self.token_layers
-        )
-
-        # Token correlation loss (REGULARIZER - staged)
-        effective_lambda_rel = self.get_effective_lambda_rel(epoch)
-        if effective_lambda_rel > 0:
-            rel_loss = self.token_corr_loss(student_patch_tokens, teacher_patch_tokens)
-        else:
-            rel_loss = torch.tensor(0.0, device=ce_loss.device)
-
-        # CKA/Gram structural loss (optional - staged)
-        effective_lambda_cka = self.get_effective_lambda_cka(epoch)
-        cka_loss = torch.tensor(0.0, device=ce_loss.device)
-        gram_loss = torch.tensor(0.0, device=ce_loss.device)
-        structural_loss_dict = {}
-
-        if self.structural_loss is not None and effective_lambda_cka > 0:
-            struct_loss, structural_loss_dict = self.structural_loss(
-                student_intermediates, teacher_intermediates, self.token_layers
-            )
-            if self.use_cka_loss:
-                cka_loss = struct_loss
-            if self.use_gram_loss and 'gram_loss_total' in structural_loss_dict:
-                gram_loss = torch.tensor(structural_loss_dict['gram_loss_total'], device=ce_loss.device)
-
-        # Gram-only loss (ablation without CKA)
-        if self.gram_only_loss is not None and epoch >= self.cka_warmup_epochs:
-            gram_struct_loss, gram_loss_dict = self.gram_only_loss(
-                student_intermediates, teacher_intermediates, self.token_layers
-            )
-            gram_loss = gram_struct_loss
-            structural_loss_dict.update(gram_loss_dict)
-
-        # Combined loss
-        total_loss = (
-            ce_loss
-            + self.lambda_tok * tok_loss
-            + effective_lambda_rel * rel_loss
-            + effective_lambda_cka * cka_loss
-        )
-        if self.gram_only_loss is not None:
-            total_loss = total_loss + self.lambda_gram * gram_loss
-
-        loss_dict = {
-            'ce_loss': ce_loss.item(),
-            'tok_loss': tok_loss.item(),
-            'rel_loss': rel_loss.item() if isinstance(rel_loss, torch.Tensor) else 0.0,
-            'cka_loss': cka_loss.item() if isinstance(cka_loss, torch.Tensor) else 0.0,
-            'gram_loss': gram_loss.item() if isinstance(gram_loss, torch.Tensor) else 0.0,
-            'effective_lambda_rel': effective_lambda_rel,
-            'effective_lambda_cka': effective_lambda_cka,
-            'total_loss': total_loss.item(),
-            **tok_loss_dict,
-            **structural_loss_dict
-        }
-
-        return total_loss, loss_dict
 
 
 class SelfSupervisedDistillationTrainer(DDPTrainer):
@@ -1531,18 +725,14 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
             if hasattr(self.teacher_model, 'get_intermediate_layers'):
                 if self.use_cls_only:
                     # CLS-only mode: Extract CLS tokens for global semantic alignment
-                    # This avoids noisy spatial interpolation and focuses on global representation
                     outputs = self.teacher_model.get_intermediate_layers(
                         teacher_input, n=layer_indices, return_class_token=True
                     )
                     for i, layer_idx in enumerate(layer_indices):
-                        # outputs[i] is tuple (patch_tokens, cls_token) when return_class_token=True
                         if isinstance(outputs[i], tuple):
                             cls_token = outputs[i][1]  # (B, D)
                         else:
-                            # Fallback: first token is CLS
                             cls_token = outputs[i][:, 0, :]  # (B, D)
-                        # Reshape to (B, 1, D) for consistency with token-based losses
                         intermediates[layer_idx] = cls_token.unsqueeze(1)
 
                     # Get final CLS token
@@ -1550,7 +740,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                         teacher_input, n=[max(layer_indices)], return_class_token=True
                     )[0]
                     if isinstance(final_output, tuple):
-                        patch_tokens = final_output[1].unsqueeze(1)  # CLS token (B, 1, D)
+                        patch_tokens = final_output[1].unsqueeze(1)
                     else:
                         patch_tokens = final_output[:, 0, :].unsqueeze(1)
                 else:
@@ -1559,8 +749,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                         teacher_input, n=layer_indices, return_class_token=False
                     )
                     for i, layer_idx in enumerate(layer_indices):
-                        teacher_tokens = outputs[i]  # (B, 196, D) for 224x224 with patch_size=14
-                        # Interpolate to student token count
+                        teacher_tokens = outputs[i]
                         teacher_tokens = self._interpolate_tokens(teacher_tokens, self.student_num_tokens)
                         intermediates[layer_idx] = teacher_tokens
 
@@ -1576,17 +765,16 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
                 def make_hook(idx):
                     def hook(module, input, output):
-                        # output is (B, N+1, D) - includes CLS token
                         if isinstance(output, tuple):
                             if self.use_cls_only:
-                                captured[idx] = output[0][:, 0:1, :]  # CLS only
+                                captured[idx] = output[0][:, 0:1, :]
                             else:
-                                captured[idx] = output[0][:, 1:, :]  # Skip CLS
+                                captured[idx] = output[0][:, 1:, :]
                         else:
                             if self.use_cls_only:
-                                captured[idx] = output[:, 0:1, :]  # CLS only
+                                captured[idx] = output[:, 0:1, :]
                             else:
-                                captured[idx] = output[:, 1:, :]  # Skip CLS
+                                captured[idx] = output[:, 1:, :]
                     return hook
 
                 # Register hooks
@@ -1606,7 +794,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                 for idx in layer_indices:
                     if idx in captured:
                         if self.use_cls_only:
-                            intermediates[idx] = captured[idx]  # Already (B, 1, D)
+                            intermediates[idx] = captured[idx]
                         else:
                             intermediates[idx] = self._interpolate_tokens(captured[idx], self.student_num_tokens)
 
@@ -1622,8 +810,6 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
         Teacher tokens: (B, N_teacher, D) where N_teacher = 196 (14x14)
         Target: (B, N_student, D) where N_student = 64 (8x8) for CIFAR
-
-        This preserves student inductive bias.
         """
         B, N, D = tokens.shape
         if N == target_num_tokens:
@@ -1691,8 +877,8 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                 if hasattr(self, 'mixup_alpha') and (self.mixup_alpha > 0 or self.cutmix_alpha > 0):
                     student_imgs, targets = self.apply_mixup(student_imgs, targets)
 
-                teacher_input = clean_imgs  # Clean images for teacher
-                student_input = student_imgs  # Augmented images for student
+                teacher_input = clean_imgs
+                student_input = student_imgs
             else:
                 # Standard batch format: (inputs, targets)
                 inputs, targets = batch
@@ -1703,7 +889,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
             if self.use_amp:
                 with autocast(**self.autocast_kwargs):
-                    # Student forward with intermediates (uses student_input)
+                    # Student forward with intermediates
                     student_module = self.ddp_model.module if hasattr(self.ddp_model, 'module') else self.ddp_model
                     student_results = student_module.forward_with_intermediates(
                         student_input, layer_indices=self.token_layers,
@@ -1713,7 +899,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                     student_intermediates = student_results['intermediates']
                     student_patch_tokens = student_results['patch_tokens']
 
-                    # Teacher forward with intermediates (uses teacher_input = clean images)
+                    # Teacher forward with intermediates
                     teacher_intermediates, teacher_patch_tokens = self.get_teacher_intermediates(
                         teacher_input, self.token_layers
                     )
@@ -1731,7 +917,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                 # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 # Backward pass
@@ -1747,7 +933,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                             )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
                 else:
                     loss.backward()
                     if (batch_idx + 1) % self.grad_accum_steps == 0:
@@ -1758,7 +944,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                                 self.config.training.gradient_clip_val
                             )
                         self.optimizer.step()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
             else:
                 # Non-AMP path
                 student_module = self.ddp_model.module if hasattr(self.ddp_model, 'module') else self.ddp_model
@@ -1783,7 +969,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                 # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     continue
 
                 loss.backward()
@@ -1796,7 +982,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                             self.config.training.gradient_clip_val
                         )
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
             # Track metrics
             total_loss += loss.item() * self.grad_accum_steps
@@ -1970,3 +1156,6 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
             logger.info(f"Self-supervised distillation completed. Best Val Acc: {self.best_val_acc:.2f}%")
 
         return dict(self.metrics_history)
+
+
+__all__ = ['DistillationTrainer', 'SelfSupervisedDistillationTrainer']

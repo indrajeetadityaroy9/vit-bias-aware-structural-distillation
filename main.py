@@ -905,6 +905,123 @@ def analyze_model(
     return results
 
 
+def analyze_locality(
+    config_path: str,
+    checkpoint_paths: list,
+    model_names: Optional[list] = None,
+    output_dir: str = 'outputs/forensics',
+    num_samples: int = 512
+) -> Dict[str, dict]:
+    """
+    Run Locality Curse forensics to compare attention patterns across models.
+
+    This analysis proves the "Locality Curse" hypothesis: CNN teachers damage
+    ViT students by forcing local attention patterns, resulting in poor generalization.
+
+    Expected three-way comparison:
+        CNN-Distilled (Low MAD) < Baseline (Medium MAD) < DINO-Distilled (High MAD)
+
+    The gap between Baseline and CNN-Distilled represents the "active harm"
+    done by the CNN teacher.
+
+    Args:
+        config_path: Path to configuration file (for model architecture and data)
+        checkpoint_paths: List of paths to model checkpoints to compare
+        model_names: Optional list of names for each model
+        output_dir: Output directory for forensics results and visualizations
+        num_samples: Number of samples for analysis
+
+    Returns:
+        Dict mapping model names to their forensics results
+
+    Example:
+        python main.py analyze-locality configs/deit_cifar_config.yaml \\
+            outputs/baseline.pth outputs/cnn_distilled.pth outputs/dino_distilled.pth \\
+            --names Baseline CNN-Distilled DINO-Distilled \\
+            --output-dir outputs/forensics
+
+    Output files:
+        - {model_name}_forensics.json: Detailed metrics per model
+        - locality_spectrum.{png,pdf}: Sorted head distances
+        - layer_progression.{png,pdf}: Attention distance by layer
+        - forensics_summary.{png,pdf}: 4-panel publication figure
+    """
+    from src.analytics import LocalityCurseForensics
+
+    config = ConfigManager.load_config(config_path)
+    setup_logging(config.logging)
+
+    device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Running Locality Curse forensics on device: {device}")
+
+    # Get dataset info
+    dataset_info = DatasetManager.get_dataset_info(config)
+    config.model.in_channels = dataset_info['in_channels']
+    config.model.num_classes = dataset_info['num_classes']
+    config.model.dataset = config.data.dataset
+
+    # Create validation data loader
+    test_dataset = DatasetManager.get_dataset(config, is_train=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=64,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory
+    )
+
+    # Get image size and patch size from config
+    img_size = config.data.img_size if hasattr(config.data, 'img_size') else 32
+    patch_size = config.vit.patch_size if hasattr(config, 'vit') else 4
+
+    # Load all models
+    models_dict = {}
+    add_safe_globals_for_checkpoints()
+
+    for i, ckpt_path in enumerate(checkpoint_paths):
+        name = model_names[i] if model_names and i < len(model_names) else f"Model_{i}"
+
+        logger.info(f"Loading model: {name} from {ckpt_path}")
+
+        # Create fresh model for each checkpoint
+        model_config = build_model_config(config)
+        model = ModelFactory.create_model(config.model.model_type, model_config)
+        model = model.to(device)
+
+        # Load checkpoint
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        # Unwrap compiled model if necessary
+        if hasattr(model, '_orig_mod'):
+            logger.info(f"Unwrapping torch.compile model for {name}")
+            model = model._orig_mod
+
+        models_dict[name] = model
+
+    logger.info(f"Loaded {len(models_dict)} models for comparison")
+
+    # Create output directory
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Run forensics
+    forensics = LocalityCurseForensics(device=str(device))
+    results = forensics.compare_models(
+        models_dict=models_dict,
+        dataloader=test_loader,
+        output_dir=str(out_path),
+        img_size=img_size,
+        patch_size=patch_size,
+        num_samples=num_samples
+    )
+
+    logger.info(f"Forensics complete. Results saved to: {out_path}")
+
+    return results
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -961,6 +1078,21 @@ def main():
     analyze_parser.add_argument('--num-samples', type=int, default=1024,
                                help='Number of samples for Hessian analysis (default: 1024)')
 
+    # Analyze locality command (Locality Curse Forensics)
+    locality_parser = subparsers.add_parser(
+        'analyze-locality',
+        help='Run Locality Curse forensics to compare attention patterns across models'
+    )
+    locality_parser.add_argument('config', type=str, help='Path to configuration file')
+    locality_parser.add_argument('checkpoints', type=str, nargs='+',
+                                help='Paths to model checkpoints (e.g., baseline.pth cnn_distilled.pth dino_distilled.pth)')
+    locality_parser.add_argument('--names', type=str, nargs='+', default=None,
+                                help='Names for each model (default: Model_0, Model_1, ...)')
+    locality_parser.add_argument('--output-dir', type=str, default='outputs/forensics',
+                                help='Output directory for forensics results')
+    locality_parser.add_argument('--num-samples', type=int, default=512,
+                                help='Number of samples for analysis (default: 512)')
+
     args = parser.parse_args()
 
     if args.command == 'train':
@@ -978,6 +1110,14 @@ def main():
             args.config,
             args.checkpoint,
             metrics=args.metrics,
+            output_dir=args.output_dir,
+            num_samples=args.num_samples
+        )
+    elif args.command == 'analyze-locality':
+        analyze_locality(
+            args.config,
+            args.checkpoints,
+            model_names=args.names,
             output_dir=args.output_dir,
             num_samples=args.num_samples
         )

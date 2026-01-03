@@ -1,3 +1,6 @@
+# =============================================================================
+# Python
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,25 +21,125 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+
+# =============================================================================
+# Virtual Environments (exclude all variations)
+# =============================================================================
 venv/
+.venv/
 env/
+.env/
 ENV/
-.venv
+env.bak/
+venv.bak/
+.python-version
+Pipfile.lock
+
+# =============================================================================
+# IDE and Editor
+# =============================================================================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+
+# =============================================================================
+# Data Files and Directories
+# =============================================================================
 data/
-logs/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# MNIST/CIFAR downloaded data
+MNIST/
+CIFAR/
+CIFAR10/
+cifar-10-batches-py/
+cifar-10-python.tar.gz
+
+# =============================================================================
+# Model Checkpoints and Outputs
+# =============================================================================
 outputs/
 checkpoints/
 results/
-downloads/
-verification_results/
+logs/
+runs/
 *.pth
 *.pt
+*.onnx
+*.safetensors
+*.bin
+
+# TensorBoard
+tensorboard/
+events.out.tfevents.*
+
+# Weights & Biases
+wandb/
+
+# =============================================================================
+# Testing and Coverage
+# =============================================================================
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# =============================================================================
+# Documentation builds
+# =============================================================================
+docs/_build/
+site/
+
+# =============================================================================
+# Jupyter Notebooks
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# =============================================================================
+# Miscellaneous
+# =============================================================================
+*.log
+*.tmp
+*.temp
+*.bak
+*.cache
+.cache/
+verification_results/
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Images generated during training/evaluation
+*.png
+*.jpg
+*.jpeg
+!configs/*.png
+!docs/*.png

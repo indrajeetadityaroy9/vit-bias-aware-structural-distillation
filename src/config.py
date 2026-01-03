@@ -8,7 +8,9 @@ logger = logging.getLogger(__name__)
 class DataConfig:
     def __init__(self, dataset=None, batch_size=64, num_workers=4, pin_memory=True,
                  persistent_workers=True, prefetch_factor=2, augmentation=None,
-                 normalization=None, data_path="./data"):
+                 normalization=None, data_path="./data",
+                 # H100 optimizations
+                 gpu_augmentation=True, drop_last=True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -18,6 +20,9 @@ class DataConfig:
         self.augmentation = augmentation if augmentation is not None else {}
         self.normalization = normalization if normalization is not None else {}
         self.data_path = data_path
+        # H100 optimizations
+        self.gpu_augmentation = gpu_augmentation  # Apply MixUp/CutMix on GPU
+        self.drop_last = drop_last  # Drop last incomplete batch (required for CUDA Graphs)
 
 class ModelConfig:
     def __init__(self, model_type="adaptive_cnn", in_channels=1, num_classes=10,
@@ -43,7 +48,7 @@ class TrainingConfig:
                  swa_start_epoch=0.75, swa_lr=0.0005,
                  # H100 optimization flags
                  use_bf16=True, use_compile=True, compile_mode='max-autotune',
-                 use_fused_optimizer=True, use_tf32=True):
+                 use_fused_optimizer=True, use_tf32=True, use_cuda_graphs=False):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -68,6 +73,7 @@ class TrainingConfig:
         self.compile_mode = compile_mode  # 'max-autotune', 'reduce-overhead', or 'default'
         self.use_fused_optimizer = use_fused_optimizer  # Use fused AdamW/SGD kernels
         self.use_tf32 = use_tf32  # Enable TF32 for matmul operations
+        self.use_cuda_graphs = use_cuda_graphs  # Enable CUDA Graphs for kernel launch optimization
 
 class LoggingConfig:
     def __init__(self, log_level="INFO", log_dir="./logs", wandb=False,

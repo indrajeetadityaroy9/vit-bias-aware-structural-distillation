@@ -1,524 +1,448 @@
-# Dataset-Adaptive Image Classification: Technical Overview
+# Technical Overview: Dataset-Adaptive CNN Framework
 
-This document provides a comprehensive technical reference for understanding the architecture, algorithms, and design decisions in this project.
+## Project Summary
 
-## 1. Project Context and Motivation
+A research framework for studying **inductive bias mismatch** in heterogeneous knowledge distillation, specifically CNN-to-ViT transfer. The core hypothesis: negative transfer from CNN→ViT distillation stems from conflicting inductive biases (locality vs. global attention), not weak teachers.
 
-This project addresses a fundamental challenge in deep learning: **how to efficiently train image classifiers on small-scale datasets** (MNIST, CIFAR-10) while leveraging modern techniques like Vision Transformers and knowledge distillation.
-
-### Key Research Questions Addressed
-
-1. Can CNNs with attention mechanisms achieve near-optimal performance on small datasets?
-2. Does knowledge distillation always improve student models?
-3. How can we avoid "negative transfer" when the teacher is weaker than what the student could achieve independently?
-
-### Core Finding: Negative Transfer Effect
-
-The project demonstrates that **CNN-distilled DeiT underperforms ViT without distillation**:
-
-```
-ViT (86.02%) > DeiT-CNN (84.39%) > CNN Teacher (82.90%)
-```
-
-This occurs because the teacher constrains the student to its suboptimal decision boundary.
-
-**Solution**: Self-supervised distillation from DINOv2 achieves **89.18%** by transferring relational structure rather than classification logits.
+**Codebase Statistics**: ~8,400 lines of Python across 10 core modules, 56 classes, 18 configuration presets.
 
 ---
 
-## 2. Model Architectures
-
-### 2.1 AdaptiveCNN (Teacher Model)
-
-**Design Philosophy**: Dataset-specific architecture that adapts depth and width based on task complexity.
-
-#### Squeeze-and-Excitation (SE) Block
-
-Channel attention mechanism that recalibrates feature responses:
+## Project Tree Structure
 
 ```
-SE(x) = x · σ(W₂ · ReLU(W₁ · GAP(x)))
-```
-
-Where:
-- `GAP(x)` = Global Average Pooling: `(1/HW) Σᵢⱼ x_{c,i,j}`
-- `W₁ ∈ ℝ^{C/r × C}` (reduction ratio r=16)
-- `W₂ ∈ ℝ^{C × C/r}`
-- `σ` = Sigmoid activation
-
-**Implementation** (`src/models.py:10-26`):
-
-```python
-y = self.avg_pool(x).view(b, c)           # (B, C, H, W) → (B, C)
-y = self.fc(y).view(b, c, 1, 1)           # (B, C) → (B, C, 1, 1)
-return x * y.expand_as(x)                  # Channel-wise scaling
-```
-
-#### Residual Block with SE
-
-```
-ResBlock(x) = ReLU(SE(BN(Conv(ReLU(BN(Conv(x)))))) + Shortcut(x))
-```
-
-#### MNIST Architecture (709K parameters)
-
-| Stage | Channels | Resolution | Blocks |
-|-------|----------|------------|--------|
-| Initial | 1→32 | 28→14 | Conv+MaxPool |
-| Stage 1 | 32 | 14×14 | 2 ResBlocks |
-| Stage 2 | 64 | 7×7 | 2 ResBlocks |
-| Stage 3 | 128 | 4×4 | 2 ResBlocks |
-| Classifier | 128→64→10 | - | FC |
-
-#### CIFAR-10 Architecture (17.6M parameters)
-
-| Stage | Channels | Resolution | Blocks |
-|-------|----------|------------|--------|
-| Initial | 3→64 | 32×32 | Conv |
-| Stage 1 | 64 | 32×32 | 2 ResBlocks |
-| Stage 2 | 128 | 16×16 | 3 ResBlocks |
-| Stage 3 | 256 | 8×8 | 3 ResBlocks |
-| Stage 4 | 512 | 4×4 | 3 ResBlocks |
-| Classifier | 512→256→10 | - | FC |
-
----
-
-### 2.2 Vision Transformer (DeiT)
-
-**Design Philosophy**: Lightweight ViT for small images with optional knowledge distillation.
-
-#### Patch Embedding
-
-Converts image into sequence of patch tokens:
-
-```
-PatchEmbed(x) = Flatten(Conv2d(x, kernel=P, stride=P))
-```
-
-For CIFAR-10 (32×32, patch_size=4):
-- Number of patches: `N = (32/4)² = 64`
-- Each patch: `4×4×3 = 48` pixels → projected to `d=192` dimensions
-
-**Hybrid Patch Embedding** (optional conv stem):
-
-```
-HybridPatchEmbed(x) = PatchProj(GELU(BN(Conv₂(GELU(BN(Conv₁(x)))))))
-```
-
-Adds locality bias before patch projection.
-
-#### Positional Embedding
-
-Learnable embeddings added to patch tokens:
-
-```
-z₀ = [x_cls; x_dist; E·x_patches] + E_pos
-```
-
-Where:
-- `x_cls ∈ ℝ^d` = Class token (learnable)
-- `x_dist ∈ ℝ^d` = Distillation token (learnable, optional)
-- `E ∈ ℝ^{d×P²C}` = Patch projection
-- `E_pos ∈ ℝ^{(N+2)×d}` = Positional embeddings
-
-**Positional Interpolation** (`src/vit.py:27-75`):
-
-For different resolutions, interpolates positional embeddings using bicubic interpolation:
-
-```python
-patch_pos = F.interpolate(patch_pos, size=(H_target, W_target), mode='bicubic')
-```
-
-#### Multi-Head Self-Attention (MHSA)
-
-```
-MHSA(z) = Concat(head₁, ..., headₕ)W^O
-
-headᵢ = Attention(zW^Q_i, zW^K_i, zW^V_i)
-
-Attention(Q, K, V) = softmax(QK^T / √d_k)V
-```
-
-**Scaled Dot-Product Attention** (`src/vit.py:206-216`):
-
-```python
-if HAS_SDPA:
-    # Flash Attention v2 on H100 (25-40% faster, 50% less memory)
-    x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-else:
-    attn = (q @ k.transpose(-2, -1)) * self.scale
-    attn = attn.softmax(dim=-1)
-    x = attn @ v
-```
-
-#### Stochastic Depth (DropPath)
-
-Regularization that randomly drops entire residual branches:
-
-```
-DropPath(x) = x / keep_prob · Bernoulli(keep_prob)
-```
-
-Drop rates increase linearly with depth: `drop_path[i] = i/(L-1) × max_rate`
-
-#### DeiT-Tiny Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Embedding dim | 192 |
-| Depth | 12 blocks |
-| Heads | 3 |
-| MLP ratio | 2.0 (code default: 4.0) |
-| Patch size | 4 |
-| Drop path rate | 0.1 |
-| Parameters | ~4M |
-
----
-
-## 3. Knowledge Distillation
-
-### 3.1 Standard Distillation (CNN → DeiT)
-
-**Two Distillation Modes** (`src/distillation.py:30-101`):
-
-#### Hard Distillation
-
-Student matches teacher's argmax predictions:
-
-```
-L_hard = (1-α)·CE(y_cls, y_true) + α·CE(y_dist, argmax(y_teacher))
-```
-
-#### Soft Distillation
-
-Temperature-scaled KL divergence (Hinton et al.):
-
-```
-L_soft = (1-α)·CE(y_cls, y_true) + α·τ²·KL(σ(y_dist/τ), σ(y_teacher/τ))
-```
-
-Where:
-- `α ∈ [0,1]` = Distillation weight
-- `τ > 0` = Temperature (default: 3.0)
-- `σ` = Softmax function
-
-**Temperature Scaling Intuition**:
-- Higher τ → softer probability distributions → more knowledge about inter-class relationships
-- τ² scaling compensates for gradient magnitude reduction
-
-#### Alpha Scheduling
-
-Progressive distillation weight adjustment:
-
-| Schedule | Formula |
-|----------|---------|
-| Constant | `α(t) = α` |
-| Linear | `α(t) = α_start + (α_end - α_start) × t/T` |
-| Cosine | `α(t) = α_start + (α_end - α_start) × (1 - cos(πt/T))/2` |
-
----
-
-### 3.2 Self-Supervised Distillation (DINOv2 → DeiT)
-
-**Design Philosophy**: Avoid negative transfer by distilling relational structure, not classification decisions.
-
-#### Two-Stage Training
-
-- **Stage A** (epochs 0-9): `L = L_CE + λ_tok·L_tok`
-- **Stage B** (epochs 10+): `L = L_CE + λ_tok·L_tok + λ_rel·L_rel`
-
-#### Token Representation Loss (L_tok)
-
-Aligns intermediate token representations via learnable projectors:
-
-```
-L_tok = (1/L) Σₗ (1 - cos(P_s(z_s^l), P_t(z_t^l)))
-```
-
-Where:
-- `z_s^l, z_t^l` = Student/teacher tokens at layer `l`
-- `P_s, P_t` = Learnable projection heads (Linear→LN→GELU→Linear→LN)
-- `cos` = Cosine similarity
-
-**Projection Head Architecture** (`src/distillation.py:653-674`):
-
-```python
-self.proj = nn.Sequential(
-    nn.Linear(in_dim, hidden_dim),
-    nn.LayerNorm(hidden_dim),
-    nn.GELU(),
-    nn.Linear(hidden_dim, out_dim),
-    nn.LayerNorm(out_dim)
-)
-```
-
-#### Token Correlation Loss (L_rel)
-
-Matches token-token correlation matrices:
-
-```
-L_rel = KL(softmax(C_s/τ), softmax(C_t/τ))
-```
-
-Where correlation matrix `C`:
-
-```
-C = normalize(z) · normalize(z)^T
-```
-
-**Pooled Mode** (efficient, O(B²) instead of O(N²)):
-
-```python
-student_pooled = student_tokens.mean(dim=1)  # (B, N, D) → (B, D)
-student_corr = student_norm @ student_norm.T  # (B, B)
-```
-
-#### Token Interpolation
-
-Aligns teacher tokens (196 for DINOv2 @ 224×224) to student tokens (64 for DeiT @ 32×32):
-
-```python
-# (B, 196, D) → (B, 14, 14, D) → interpolate → (B, 8, 8, D) → (B, 64, D)
-tokens = tokens.transpose(1, 2).reshape(B, D, H_t, H_t)
-tokens = F.interpolate(tokens, size=(H_s, H_s), mode='bilinear')
-tokens = tokens.reshape(B, D, -1).transpose(1, 2)
-```
-
-#### Loss Configuration
-
-| Parameter | Value | Role |
-|-----------|-------|------|
-| λ_tok | 1.0 | Token representation weight |
-| λ_rel | 0.1 | Token correlation weight |
-| Projection dim | 256 | Common embedding space |
-| Token layers | [6, 11] | Intermediate extraction points |
-| rel_warmup_epochs | 10 | Delay L_rel activation |
-
----
-
-## 4. Training Infrastructure
-
-### 4.1 Distributed Data Parallel (DDP)
-
-**Process Model** (`src/training.py:276-533`):
-- Each GPU runs independent process with rank ∈ [0, world_size)
-- NCCL backend for GPU-to-GPU communication
-- `DistributedSampler` ensures non-overlapping data shards
-
-**Metric Aggregation**:
-
-```python
-dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-avg_loss = loss_tensor.item() / (batch_count * world_size)
-```
-
-**Batch Size**: Config specifies per-GPU batch; effective batch = `batch_size × num_gpus`
-
-### 4.2 Mixed Precision Training
-
-**BF16 (H100 optimized)**:
-- Same exponent range as FP32 → no GradScaler needed
-- 2× memory savings, minimal accuracy impact
-
-**FP16 (other GPUs)**:
-- Requires GradScaler for numerical stability
-- Loss scaling prevents underflow
-
-```python
-if config.training.use_bf16:
-    self.autocast_kwargs = {'device_type': 'cuda', 'dtype': torch.bfloat16}
-else:
-    self.scaler = GradScaler()
-    self.autocast_kwargs = {'device_type': 'cuda'}
-```
-
-### 4.3 Label Smoothing Cross-Entropy
-
-Prevents overconfident predictions:
-
-```
-L_smooth = (1-ε)·CE(y, k) + ε·(1/K)·Σᵢ CE(y, i)
-```
-
-**Handles Soft Labels** (from MixUp/CutMix):
-
-```python
-if target.dim() > 1:  # Soft labels (B, K)
-    loss = -(target * log_softmax(pred)).sum(dim=-1)
-```
-
-### 4.4 Stochastic Weight Averaging (SWA)
-
-Averages weights in final 25% of training:
-
-```
-w_SWA = (1/n) Σᵢ wᵢ
-```
-
-Activates at epoch `⌊0.75 × num_epochs⌋`, uses reduced LR (default: 0.0005).
-
-**Post-Training**: Updates BatchNorm statistics on full training set via `torch.optim.swa_utils.update_bn()`. See `src/training.py:600` and `src/distillation.py:554,1946`.
-
-### 4.5 Gradient Clipping
-
-Prevents exploding gradients:
-
-```python
-torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+dataset-adaptive-CNN/
+├── main.py                          # Unified CLI entry point (1,050 lines)
+│   ├── train                        # Standard training (AdaptiveCNN, DeiT)
+│   ├── train-distill                # CNN→DeiT knowledge distillation
+│   ├── train-ss-distill             # DINOv2→DeiT self-supervised distillation
+│   ├── evaluate                     # Test set evaluation with metrics
+│   ├── test                         # Single image inference with TTA
+│   ├── analyze                      # CKA, attention, Hessian analytics
+│   └── analyze-locality             # Locality Curse Forensics comparison
+│
+├── src/                             # Core library modules
+│   ├── config.py                    # Type-safe configuration (440 lines)
+│   │   ├── DataConfig               # Dataset, augmentation, normalization
+│   │   ├── ModelConfig              # Architecture specification
+│   │   ├── TrainingConfig           # Optimizer, scheduler, H100 flags
+│   │   ├── ViTConfig                # DeiT-specific parameters
+│   │   ├── DistillationConfig       # CNN teacher settings
+│   │   ├── SelfSupervisedDistillationConfig  # DINOv2 teacher settings
+│   │   └── ConfigManager            # YAML/JSON loading with validation
+│   │
+│   ├── models.py                    # CNN architectures (254 lines)
+│   │   ├── SEBlock                  # Squeeze-and-Excitation attention
+│   │   ├── ResidualBlock            # Residual block with optional SE
+│   │   ├── AdaptiveCNN              # Dataset-adaptive SE-ResNet
+│   │   │   ├── MNIST variant        # 709K params, 6 blocks
+│   │   │   └── CIFAR variant        # 17.6M params, 11 blocks
+│   │   └── ModelFactory             # Registry pattern for model creation
+│   │
+│   ├── vit.py                       # Vision Transformer (716 lines)
+│   │   ├── DropPath                 # Stochastic depth regularization
+│   │   ├── PatchEmbed               # Conv2d patch tokenization
+│   │   ├── HybridPatchEmbed         # 2-layer conv stem option
+│   │   ├── MultiHeadSelfAttention   # MHSA with Flash Attention v2
+│   │   ├── MLP                      # Transformer FFN with GELU
+│   │   ├── TransformerBlock         # Pre-LN architecture
+│   │   └── DeiT                     # Complete DeiT-Tiny implementation
+│   │       ├── Distillation token   # Separate head for KD
+│   │       ├── Position interpolation # Multi-resolution support
+│   │       └── forward_with_intermediates() # Layer extraction
+│   │
+│   ├── teachers.py                  # Teacher architectures (310 lines)
+│   │   ├── BasicBlock               # ResNet residual block
+│   │   ├── ResNet18CIFAR            # Classic CNN (11.2M params)
+│   │   └── ConvNeXtV2Tiny           # Modern hybrid CNN (28.6M params)
+│   │
+│   ├── training.py                  # Training infrastructure (657 lines)
+│   │   ├── build_optimizer()        # H100-optimized (fused kernels)
+│   │   ├── build_scheduler()        # Step, Cosine, Plateau, Cyclic
+│   │   ├── build_checkpoint_dict()  # Complete state serialization
+│   │   ├── restore_rng_state()      # Reproducible resume
+│   │   ├── EarlyStopping            # Patience-based stopping
+│   │   ├── LabelSmoothingCrossEntropy # Soft label support
+│   │   ├── Trainer                  # Single-GPU with AMP, SWA
+│   │   └── DDPTrainer               # Distributed Data Parallel
+│   │
+│   ├── distillation.py              # Knowledge distillation (1,973 lines)
+│   │   ├── DistillationLoss         # Hard/soft KL divergence
+│   │   ├── DistillationTrainer      # CNN→DeiT trainer
+│   │   ├── ProjectionHead           # Dimension alignment MLP
+│   │   ├── TokenRepresentationLoss  # L_tok: cosine/MSE on tokens
+│   │   ├── TokenCorrelationLoss     # L_rel: correlation matrix KL
+│   │   ├── CKALoss                  # Centered Kernel Alignment
+│   │   ├── GramMatrixLoss           # Frobenius norm (ablation)
+│   │   ├── LayerWiseStructuralLoss  # Multi-layer structural matching
+│   │   ├── SelfSupervisedDistillationLoss # Combined loss scheduler
+│   │   └── SelfSupervisedDistillationTrainer # DINOv2→DeiT trainer
+│   │
+│   ├── analytics.py                 # Research analytics (1,674 lines)
+│   │   ├── HessianAnalyzer          # Loss landscape curvature
+│   │   ├── AttentionDistanceAnalyzer # Locality metrics
+│   │   │   └── compute_head_statistics() # Per-head MAD, entropy
+│   │   ├── CKAAnalyzer              # Representational similarity
+│   │   ├── AnalyticsRunner          # Unified analysis orchestrator
+│   │   ├── AnalyticsVisualizer      # Publication-quality plots
+│   │   └── LocalityCurseForensics   # Comparative diagnostics
+│   │
+│   ├── datasets.py                  # Data loading (598 lines)
+│   │   ├── Cutout                   # Occlusion augmentation
+│   │   ├── MixingDataset            # MixUp/CutMix wrapper
+│   │   ├── DualAugmentDataset       # Teacher/student split paths
+│   │   └── DatasetManager           # Static loader utilities
+│   │
+│   ├── evaluation.py                # Model evaluation (327 lines)
+│   │   ├── ModelEvaluator           # Metrics, confusion matrix, ROC
+│   │   └── TestTimeAugmentation     # Multi-view averaging
+│   │
+│   └── visualization.py             # Visualization utilities (306 lines)
+│       ├── FeatureMapVisualizer     # Layer activation grids
+│       ├── GradCAM                  # Gradient-weighted activation maps
+│       └── TrainingVisualizer       # Loss/accuracy curves
+│
+├── configs/                         # YAML configuration presets (18 files)
+│   ├── mnist_config.yaml            # MNIST baseline
+│   ├── cifar_config.yaml            # CIFAR-10 baseline
+│   ├── deit_cifar_config.yaml       # DeiT standalone training
+│   ├── deit_resnet18_distill_config.yaml    # CNN→DeiT distillation
+│   ├── deit_ss_distill_cka_cifar_config.yaml # DINOv2→DeiT with CKA
+│   ├── resnet18_cifar_config.yaml   # ResNet-18 teacher training
+│   └── ...                          # Additional ablation configs
+│
+├── tests/                           # Test suite
+│   ├── test_critical_bugs.py        # Core functionality tests
+│   └── test_forensics_dry_run.py    # Forensics pipeline validation
+│
+├── scripts/
+│   └── generate_comparison_plots.py # Results visualization
+│
+├── pyproject.toml                   # Package configuration
+├── CLAUDE.md                        # AI assistant guidance
+└── README.md                        # Project documentation
 ```
 
 ---
 
-## 5. Data Augmentation
+## Theoretical Foundations
 
-### 5.1 Cutout
+### 1. The Locality Curse Hypothesis
 
-Randomly masks rectangular regions:
+**Core Claim**: CNN teachers damage ViT students by forcing local attention patterns, leading to:
+- Reduced effective receptive field
+- Sharper loss landscape (poor generalization)
+- Lower test accuracy despite strong training signals
 
-```python
-mask[y1:y2, x1:x2] = 0.0
-img = img * mask
+**Inductive Bias Conflict**:
+| Architecture | Inductive Bias | Attention Pattern |
+|--------------|----------------|-------------------|
+| CNN (ResNet) | Strong locality | Fixed 3×3 receptive field |
+| ViT (DeiT)   | Global context  | Learnable full-image attention |
+| CNN (ConvNeXt)| Hybrid         | Depthwise + global aggregation |
+
+### 2. Knowledge Distillation Framework
+
+**Standard KD Loss** (Hinton et al., 2015):
+```
+L_KD = α·L_CE(y, p_s) + (1-α)·τ²·KL(softmax(z_t/τ) || softmax(z_s/τ))
+```
+where:
+- `α`: Hard label weight (0.5 default)
+- `τ`: Temperature (4.0 default, softens distributions)
+- `z_t, z_s`: Teacher/student logits
+
+**DeiT Distillation** (Touvron et al., 2021):
+- Separate distillation token learns from teacher
+- Hard distillation: `L_dist = CE(argmax(z_t), p_dist)`
+- Soft distillation: `L_dist = KL(z_t/τ || z_dist/τ)`
+
+### 3. Self-Supervised Structural Distillation
+
+**Token Representation Loss (L_tok)**:
+```
+L_tok = Σ_l λ_l · (1 - cos(proj(s_l), interp(t_l)))
+```
+- Matches intermediate token representations
+- Bilinear interpolation for resolution mismatch (196→64 tokens)
+
+**Token Correlation Loss (L_rel)** (CSKD-inspired):
+```
+L_rel = KL(corr(S_l) || corr(T_l))
+```
+- Matches self-correlation structure, not absolute values
+- Staged warmup: disabled for first N epochs
+
+**Centered Kernel Alignment (CKA)** (Kornblith et al., 2019):
+```
+CKA(X, Y) = HSIC(X, Y) / √(HSIC(X, X) · HSIC(Y, Y))
+```
+- Scale-invariant structural similarity
+- Linear kernel: `K = XX^T`
+- RBF kernel: `K_ij = exp(-||x_i - x_j||² / 2σ²)`
+
+### 4. Loss Landscape Analysis
+
+**Hessian Trace** (Spaced KD, Theorem 1):
+```
+Tr(H) = Σ_i λ_i  (sum of eigenvalues)
+```
+- Estimated via Hutchinson's method (stochastic trace)
+- Lower trace → flatter landscape → better generalization
+- **Hypothesis**: CNN-distilled models have higher trace
+
+**Attention Distance Metric**:
+```
+d^{l,h} = Σ_{i,j} A^{l,h}_{i,j} · ||pos_i - pos_j||_2
+```
+- Weighted average distance in patch coordinates
+- Lower distance → more local attention → "cursed"
+
+**CLS Spatial Dispersion**:
+```
+σ²_CLS = Var_spatial(A_{CLS→patches})
+```
+- Variance of CLS attention across spatial grid
+- Lower dispersion → focused attention → local bias
+
+---
+
+## Key Mechanisms
+
+### Training Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Configuration Loading                      │
+│  YAML → ConfigManager → DataConfig + ModelConfig + ...       │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Data Preparation                          │
+│  DatasetManager.create_data_loaders()                        │
+│  ├── MixingDataset (MixUp/CutMix)                           │
+│  └── DualAugmentDataset (clean teacher / aug student)       │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Model Creation                            │
+│  ModelFactory.create_model()                                 │
+│  ├── Student: DeiT (trainable)                              │
+│  └── Teacher: ResNet18/ConvNeXt/DINOv2 (frozen)             │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Training Loop (DDP)                         │
+│  DDPTrainer / DistillationTrainer / SSDistillTrainer         │
+│  ├── Forward: student(x) → cls_logits, dist_logits          │
+│  ├── Forward: teacher(x) → teacher_out (no_grad)            │
+│  ├── Loss: L_CE + L_dist + L_tok + L_rel + L_CKA            │
+│  ├── Backward: gradient accumulation + clipping              │
+│  ├── Optimizer step (fused AdamW)                           │
+│  └── Checkpoint: build_checkpoint_dict()                     │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Evaluation                               │
+│  ModelEvaluator.evaluate()                                   │
+│  ├── Accuracy, Precision, Recall, F1                        │
+│  ├── Confusion matrix, ROC curves                           │
+│  └── TestTimeAugmentation (optional)                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 MixUp
-
-Linear interpolation of images and labels:
+### Analytics Pipeline
 
 ```
-x̃ = λ·x₁ + (1-λ)·x₂
-ỹ = λ·y₁ + (1-λ)·y₂
-
-λ ~ Beta(α, α)
+┌─────────────────────────────────────────────────────────────┐
+│                   Trained DeiT Models                         │
+│  CNN-Distilled | DINO-Distilled | Baseline (no distillation) │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  LocalityCurseForensics                       │
+│  ├── HessianAnalyzer.compute_trace()                        │
+│  │   └── Hutchinson's estimator → loss curvature            │
+│  ├── AttentionDistanceAnalyzer                              │
+│  │   └── compute_head_statistics()                          │
+│  │       ├── mean_distance (patch-to-patch MAD)             │
+│  │       ├── entropy (attention concentration)               │
+│  │       ├── cls_dispersion (spatial variance)              │
+│  │       └── cls_self_attn (collapse indicator)             │
+│  └── CKAAnalyzer.compute_cka_matrix()                       │
+│      └── Layer-to-layer alignment heatmap                   │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  AnalyticsVisualizer                          │
+│  ├── plot_locality_spectrum() → sorted head distances        │
+│  ├── plot_layer_progression() → distance by layer           │
+│  ├── plot_forensics_summary() → 4-panel figure              │
+│  └── plot_cka_heatmap() → representational similarity       │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Expected Results                          │
+│  CNN-Distilled < Baseline < DINO-Distilled (for MAD)         │
+│  CNN-Distilled > Baseline > DINO-Distilled (for Hessian)     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 CutMix
-
-Rectangular patch mixing with area-proportional labels:
+### H100 Optimization Stack
 
 ```
-x̃[:, bbx1:bbx2, bby1:bby2] = x₂[:, bbx1:bbx2, bby1:bby2]
-λ = 1 - (area_cut / area_total)
-ỹ = λ·y₁ + (1-λ)·y₂
-```
-
-**Bounding Box Sampling**:
-
-```python
-cut_rat = np.sqrt(1 - lam)
-cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
-cx, cy = np.random.randint(W), np.random.randint(H)
-```
-
-### 5.4 AutoAugment
-
-Learned augmentation policies (CIFAR-10 policy includes: ShearX/Y, TranslateX/Y, Rotate, AutoContrast, Equalize, Solarize, Posterize, etc.)
-
-### 5.5 RandAugment
-
-Random N operations with magnitude M:
-
-```python
-transforms.RandAugment(num_ops=2, magnitude=9)
+┌─────────────────────────────────────────────────────────────┐
+│                   TrainingConfig Flags                        │
+│  use_bf16=True, use_compile=True, use_fused_optimizer=True   │
+└───────────────────────────┬─────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Hardware Acceleration Layers                     │
+├─────────────────────────────────────────────────────────────┤
+│  BF16 Mixed Precision                                        │
+│  └── torch.autocast('cuda', dtype=torch.bfloat16)           │
+│  └── No GradScaler needed (BF16 has same exponent as FP32)  │
+├─────────────────────────────────────────────────────────────┤
+│  Flash Attention v2 (SDPA)                                   │
+│  └── F.scaled_dot_product_attention()                       │
+│  └── 25-40% speedup, O(N) memory vs O(N²)                   │
+├─────────────────────────────────────────────────────────────┤
+│  Fused Optimizers                                            │
+│  └── torch.optim.AdamW(fused=True)                          │
+│  └── Single kernel for param update                         │
+├─────────────────────────────────────────────────────────────┤
+│  TF32 Matmul                                                 │
+│  └── torch.backends.cuda.matmul.allow_tf32 = True           │
+│  └── 3.5x faster on H100 Tensor Cores                       │
+├─────────────────────────────────────────────────────────────┤
+│  torch.compile                                               │
+│  └── Graph fusion, kernel optimization                       │
+│  └── Modes: default, reduce-overhead, max-autotune          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 6. Optimization Strategies
-
-### 6.1 Optimizers
-
-| Optimizer | Use Case | Key Features |
-|-----------|----------|--------------|
-| AdamW | MNIST, ViT | Decoupled weight decay |
-| SGD+Nesterov | CIFAR CNN | Momentum with lookahead |
-
-**Fused Optimizers** (PyTorch 2.0+, H100): Single CUDA kernel for 10-30% speedup.
-
-### 6.2 Learning Rate Schedules
-
-**Cosine Annealing**:
+## Distillation Loss Hierarchy
 
 ```
-η(t) = η_min + (η_max - η_min) × (1 + cos(πt/T)) / 2
-```
-
-**Warmup** (first N epochs):
-
-```
-η(t) = η_max × (t+1) / warmup_epochs
-```
-
-**Implementation**: Warmup is applied at the training loop level via `GradualWarmupScheduler` or manual LR adjustment in epoch callbacks. See `src/training.py` scheduler integration and distillation trainer epoch loops.
-
-### 6.3 Gradient Accumulation
-
-Simulates larger batch sizes:
-
-```python
-loss = loss / grad_accum_steps
-loss.backward()
-if (batch_idx + 1) % grad_accum_steps == 0:
-    optimizer.step()
-    optimizer.zero_grad()
+SelfSupervisedDistillationLoss
+│
+├── L_CE: Cross-entropy on CLS head
+│   └── LabelSmoothingCrossEntropy (supports soft labels)
+│
+├── L_tok: TokenRepresentationLoss
+│   ├── Cosine similarity on intermediate tokens
+│   ├── Projection head for dimension alignment
+│   └── Bilinear interpolation for token count mismatch
+│
+├── L_rel: TokenCorrelationLoss
+│   ├── KL divergence on correlation matrices
+│   ├── Staged warmup (disabled for first N epochs)
+│   └── Temperature scaling for soft matching
+│
+├── L_cka: CKALoss
+│   ├── Centered Kernel Alignment
+│   ├── Linear or RBF kernel options
+│   └── CLS-only mode for global semantics
+│
+└── L_gram: GramMatrixLoss (ablation baseline)
+    └── Frobenius norm of gram matrices
 ```
 
 ---
 
-## 7. H100-Specific Optimizations
+## Configuration System
 
-| Optimization | Speedup | Memory Savings |
-|--------------|---------|----------------|
-| BF16 (no scaler) | 25-40% | 50% |
-| torch.compile | 30-50% | - |
-| Fused optimizers | 10-30% | - |
-| Flash Attention v2 | 25-40% | 50% |
-| TF32 matmul | Up to 8× | - |
+### Key Config Relationships
 
-**torch.compile Modes**:
-- `max-autotune`: Best runtime, slowest compilation
-- `reduce-overhead`: Balanced
-- `default`: Fastest compilation
+```yaml
+# Model determines input processing
+model.model_type: deit → requires vit config
+model.model_type: adaptive_cnn → uses model.architecture
 
----
+# Training mode determines loss
+train → L_CE only
+train-distill → L_CE + L_dist (DistillationConfig required)
+train-ss-distill → L_CE + L_tok + L_rel + L_cka (SSDistillConfig required)
 
-## 8. Experimental Results Summary
+# DINOv2 teacher requires specific settings
+ss_distillation.teacher_type: dinov2
+ss_distillation.teacher_model_name: dinov2_vits14
+ss_distillation.teacher_embed_dim: 384
+ss_distillation.use_dual_augment: true  # Critical for DINOv2
+```
 
-| Model | MNIST | CIFAR-10 | Parameters |
-|-------|-------|----------|------------|
-| AdaptiveCNN | 99.08% | 82.90% | 709K / 17.6M |
-| DeiT (CNN distilled) | 99.54% | 84.39% | 4M |
-| ViT (no distillation) | 99.64% | 86.02% | 4M |
-| DeiT (CST-SSL) | - | **89.18%** | 4M |
+### Preset Configurations
 
-**Key Insight**: Self-supervised distillation from DINOv2 outperforms both CNN distillation (+4.79%) and standalone ViT (+3.16%) by transferring rich feature structure without task-specific bias.
-
----
-
-## 9. File Reference
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `main.py` | 977 | CLI entry point, unified DDP training orchestration |
-| `src/config.py` | 439 | Configuration classes, YAML loading |
-| `src/models.py` | 253 | AdaptiveCNN, SEBlock, ResidualBlock, ModelFactory |
-| `src/vit.py` | 715 | DeiT, PatchEmbed, MHSA, TransformerBlock |
-| `src/training.py` | 605 | Trainer, DDPTrainer, EarlyStopping; utilities: `build_optimizer`, `build_scheduler`, `build_checkpoint_dict` |
-| `src/distillation.py` | 1951 | DistillationTrainer, SelfSupervisedDistillationTrainer, CKALoss, GramMatrixLoss |
-| `src/datasets.py` | 585 | DatasetManager, Cutout, MixingDataset (unified MixUp/CutMix) |
-| `src/evaluation.py` | 326 | ModelEvaluator, TestTimeAugmentation |
-| `src/visualization.py` | 305 | GradCAM, FeatureMapVisualizer, TrainingVisualizer |
-| `src/analytics.py` | 1099 | HessianAnalyzer, CKAAnalyzer, AttentionDistanceAnalyzer, AnalyticsVisualizer |
-| `src/teachers.py` | 309 | ResNet18CIFAR, ConvNeXtV2Tiny teacher models |
+| Config | Dataset | Model | Training Mode | Key Settings |
+|--------|---------|-------|---------------|--------------|
+| `cifar_config.yaml` | CIFAR-10 | AdaptiveCNN | Standard | 200 epochs, AutoAugment |
+| `deit_cifar_config.yaml` | CIFAR-10 | DeiT-Tiny | Standard | 300 epochs, drop_path=0.1 |
+| `deit_resnet18_distill_config.yaml` | CIFAR-10 | DeiT-Tiny | CNN→ViT | α=0.5, τ=4.0 |
+| `deit_ss_distill_cka_cifar_config.yaml` | CIFAR-10 | DeiT-Tiny | DINOv2→ViT | CKA + L_tok |
 
 ---
 
-## 10. References
+## Expected Experimental Results
 
-1. **DeiT**: Touvron et al., "Training data-efficient image transformers & distillation through attention" (2021)
-2. **SE-Net**: Hu et al., "Squeeze-and-Excitation Networks" (2018)
-3. **Knowledge Distillation**: Hinton et al., "Distilling the Knowledge in a Neural Network" (2015)
-4. **DINOv2**: Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision" (2023)
-5. **CutMix**: Yun et al., "CutMix: Regularization Strategy to Train Strong Classifiers" (2019)
-6. **MixUp**: Zhang et al., "mixup: Beyond Empirical Risk Minimization" (2018)
-7. **AutoAugment**: Cubuk et al., "AutoAugment: Learning Augmentation Strategies from Data" (2019)
-8. **Stochastic Depth**: Huang et al., "Deep Networks with Stochastic Depth" (2016)
+### Three-Way Model Comparison
+
+| Metric | CNN-Distilled | Baseline | DINO-Distilled |
+|--------|---------------|----------|----------------|
+| Test Accuracy | ~88% | ~85% | >89% |
+| Hessian Trace | High (sharp) | Medium | Low (flat) |
+| Avg Attention Distance | Low (local) | Medium | High (global) |
+| Collapsed Heads Ratio | High | Medium | Low |
+| CLS Dispersion | Low (focused) | Medium | High (broad) |
+
+### Interpretation
+
+- **CNN-Distilled < Baseline**: Negative transfer confirmed
+- **DINO-Distilled > Baseline**: Self-supervised teachers help
+- **High Hessian for CNN**: Sharper minima = worse generalization
+- **Low MAD for CNN**: Locality curse = attention forced local
+
+---
+
+## Usage Examples
+
+### Training a Baseline DeiT
+```bash
+python main.py train configs/deit_cifar_config.yaml --num-gpus 2
+```
+
+### CNN→DeiT Knowledge Distillation
+```bash
+# First train the teacher
+python main.py train configs/resnet18_cifar_config.yaml --num-gpus 2
+
+# Then distill to student
+python main.py train-distill configs/deit_resnet18_distill_config.yaml --num-gpus 2
+```
+
+### DINOv2→DeiT Self-Supervised Distillation
+```bash
+python main.py train-ss-distill configs/deit_ss_distill_cka_cifar_config.yaml --num-gpus 2
+```
+
+### Locality Curse Forensics
+```bash
+python main.py analyze-locality configs/deit_cifar_config.yaml \
+    outputs/cnn_distilled/best.pth \
+    outputs/baseline/best.pth \
+    outputs/dino_distilled/best.pth \
+    -n "CNN-Distilled" -n "Baseline" -n "DINO-Distilled" \
+    -o outputs/forensics
+```
+
+---
+
+## References
+
+1. **DeiT**: Touvron et al., "Training data-efficient image transformers & distillation through attention" (ICML 2021)
+2. **CSKD**: Chen et al., "Cross-Architecture Knowledge Distillation" (CVPR 2022)
+3. **CKA**: Kornblith et al., "Similarity of Neural Network Representations Revisited" (ICML 2019)
+4. **Spaced KD**: "Knowledge Distillation with Spaced Repetition" (ICLR 2025)
+5. **DINOv2**: Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision" (CVPR 2024)
+6. **Flash Attention**: Dao et al., "FlashAttention-2: Faster Attention with Better Parallelism" (ICLR 2024)

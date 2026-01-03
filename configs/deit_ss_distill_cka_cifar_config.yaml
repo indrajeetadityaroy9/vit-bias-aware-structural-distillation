@@ -8,10 +8,12 @@ data:
     random_flip: true
     auto_augment: true
     cutout: true
-    # NOTE: MixUp/CutMix applied in training loop AFTER unpacking dual-path batch
-    cutmix: false       # Handled in training loop
-    mixup: false        # Handled in training loop
-  batch_size: 512       # Per GPU - leaves room for DINOv2 teacher
+    # NOTE: MixUp/CutMix applied on GPU in training loop
+    cutmix: true        # GPU-side CutMix
+    mixup: true         # GPU-side MixUp
+    mixup_alpha: 0.8
+    cutmix_alpha: 1.0
+  batch_size: 2048      # Per GPU - balanced for DINOv2 teacher memory
   data_path: ./data
   dataset: cifar
   normalization:
@@ -21,6 +23,9 @@ data:
   persistent_workers: true
   pin_memory: true
   prefetch_factor: 4
+  # H100 optimizations
+  gpu_augmentation: true
+  drop_last: true
 
 device: cuda
 experiment_name: deit_dinov2_cka_distill
@@ -52,7 +57,7 @@ vit:
 
 training:
   num_epochs: 200
-  learning_rate: 0.0005   # Lower for distillation stability
+  learning_rate: 0.001    # Scaled for batch_size=2048 (sqrt scaling)
   weight_decay: 0.05
   optimizer: adamw
   scheduler: cosine
@@ -72,11 +77,12 @@ training:
     T_max: 200
     eta_min: 0.000001
   # H100 optimizations
-  use_bf16: true
-  use_compile: true
-  compile_mode: max-autotune
-  use_fused_optimizer: true
-  use_tf32: true
+  use_bf16: true          # Native BF16 (no GradScaler)
+  use_compile: true       # torch.compile optimization
+  compile_mode: max-autotune  # Optimal Triton kernels
+  use_fused_optimizer: true   # Fused AdamW
+  use_tf32: true          # TF32 matmul acceleration
+  use_cuda_graphs: false  # Disable for distillation (dynamic teacher outputs)
 
 # Self-supervised distillation with CKA structural loss
 ss_distillation:
