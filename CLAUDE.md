@@ -57,10 +57,15 @@ pytest tests/test_critical_bugs.py::TestTokenCorrelationLoss -v
 - **`main.py`**: Unified CLI entry point with `unified_ddp_worker()` handling all training modes (standard, distill, ss_distill)
 - **`src/models.py`**: `ModelFactory` creates models; `AdaptiveCNN` with SE blocks for MNIST/CIFAR
 - **`src/vit.py`**: `DeiT` implementation with distillation token, hybrid patch embedding, `forward_with_intermediates()` for extracting layer representations
-- **`src/distillation.py`**: Knowledge distillation trainers:
-  - `DistillationTrainer`: CNN→DeiT soft/hard KL distillation
-  - `SelfSupervisedDistillationTrainer`: DINOv2→DeiT with CKA/token correlation losses
-- **`src/training.py`**: `DDPTrainer` base class with DDP, AMP (BF16), SWA, gradient clipping
+- **`src/distillation/`**: Knowledge distillation module
+  - `engine.py`: `DistillationTrainer` (CNN→DeiT soft/hard KL), `SelfSupervisedDistillationTrainer` (DINOv2→DeiT)
+  - `teachers.py`: DINOv2 teacher loading (`load_dino_teacher()`)
+  - `losses/`: `standard.py` (KL), `token.py` (TokenRepresentationLoss, TokenCorrelationLoss), `structural.py` (CKALoss, GramMatrixLoss), `combined.py`
+- **`src/training/`**: Training infrastructure
+  - `engine.py`: `Trainer` and `DDPTrainer` with DDP, AMP (BF16), SWA, gradient clipping
+  - `checkpointing.py`: `build_checkpoint_dict()`, `restore_rng_state()` for reproducibility
+  - `optimizers.py`: Fused optimizers and schedulers
+  - `components.py`: `EarlyStopping`, `LabelSmoothing`
 
 ### Distillation Loss Hierarchy
 
@@ -98,15 +103,15 @@ Registered in `ModelFactory`:
 
 ## Key Implementation Details
 
-- **Checkpoints**: Use `build_checkpoint_dict()` and `restore_rng_state()` from `src/training.py` for reproducibility
-- **H100 optimizations**: BF16 (`use_bf16`), `torch.compile` (`use_compile`), TF32 matmul (`use_tf32`)
+- **Checkpoints**: Use `build_checkpoint_dict()` and `restore_rng_state()` from `src/training/checkpointing.py` for reproducibility
+- **H100 optimizations**: BF16 (`use_bf16`), `torch.compile` (`use_compile`), TF32 matmul (`use_tf32`), fused optimizers (`use_fused_optimizer`)
 - **DDP**: All training uses `DistributedDataParallel`; single GPU is DDP with world_size=1
-- **Analytics**: `AnalyticsRunner` in `src/analytics.py` computes CKA matrices, attention distances, Hessian trace
-- **Locality Curse Forensics**: `LocalityCurseForensics` class for proving CNN→ViT inductive bias mismatch
+- **Analytics**: `AnalyticsRunner` in `src/analytics/engine.py` computes CKA matrices, attention distances, Hessian trace
+- **Locality Curse Forensics**: `LocalityCurseForensics` class in `src/analytics/engine.py` for proving CNN→ViT inductive bias mismatch
 
 ### Locality Curse Forensics Kit
 
-Diagnostic toolkit in `src/analytics.py` to prove the "Locality Curse" hypothesis:
+Diagnostic toolkit in `src/analytics/engine.py` to prove the "Locality Curse" hypothesis:
 
 **Core Hypothesis**: CNN teachers damage ViT students by forcing local attention patterns.
 
@@ -129,3 +134,31 @@ CNN-Distilled (local) < Baseline (medium) < DINO-Distilled (global)
 - `forensics_summary.png`: 4-panel publication figure
 
 **Safety Check**: If `cls_collapse_ratio > 0.5`, model has feature collapse (different pathology than locality curse)
+
+### Analytics Module Structure
+
+```
+src/analytics/
+├── engine.py           # AnalyticsRunner, LocalityCurseForensics
+├── metrics/
+│   ├── attention.py    # AttentionDistanceAnalyzer
+│   ├── representation.py  # CKA computation
+│   └── geometry.py     # Hessian analysis
+└── visualization/
+    └── plotting.py     # Publication-quality plots
+```
+
+### Important Training Flags
+
+In `TrainingConfig`:
+- `use_bf16`: BF16 instead of FP16 (native H100 support, no GradScaler needed)
+- `use_compile`: Enable `torch.compile` for kernel fusion
+- `compile_mode`: 'default', 'reduce-overhead', or 'max-autotune'
+- `use_fused_optimizer`: Use fused AdamW/SGD kernels
+- `use_tf32`: Enable TF32 for matrix operations
+
+In `SelfSupervisedDistillationConfig`:
+- `rel_warmup_epochs`: Delay correlation loss for training stability
+- `cka_warmup_epochs`: Delay CKA loss activation
+- `use_dual_augment`: Clean images for teacher, augmented for student
+- `use_cls_only`: Use CLS tokens only for CKA (avoids spatial interpolation noise)

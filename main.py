@@ -25,7 +25,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from src.config import (
+# Core infrastructure
+from src.core import (
     ConfigManager,
     Config,
     DataConfig,
@@ -35,10 +36,19 @@ from src.config import (
     ViTConfig,
     DistillationConfig,
     SelfSupervisedDistillationConfig,
-    setup_logging
+    setup_logging,
+    setup_logging_for_rank,
+    set_seed,
+    find_free_port,
+    setup_ddp_environment,
 )
+# Model zoo (unified registry)
+from src.modeling import create_model
+# Data pipeline (with dataset registry)
+from src.data import get_dataset_info, preprocess_image
+# Legacy imports for backward compatibility
+from src.datasets import DatasetManager
 from src.models import ModelFactory
-from src.datasets import DatasetManager, preprocess_image
 from src.evaluation import ModelEvaluator, TestTimeAugmentation
 from src.training import DDPTrainer
 from src.distillation import DistillationTrainer, SelfSupervisedDistillationTrainer, load_dino_teacher
@@ -49,47 +59,8 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Utility Functions
+# Utility Functions (set_seed, find_free_port, setup_ddp_environment are in src.core)
 # =============================================================================
-
-def set_seed(seed: int) -> None:
-    """
-    Set random seeds for partial reproducibility.
-
-    Note: cuDNN benchmark=True and deterministic=False are set for training speed.
-    This means runs are NOT fully deterministic but benefit from faster kernel selection.
-    For strict reproducibility, set benchmark=False and deterministic=True.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-
-
-def find_free_port() -> int:
-    """Find a free port for DDP communication."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
-
-
-def setup_ddp_environment(rank: int, world_size: int, port: Optional[int] = None) -> None:
-    """Set up DDP environment variables and initialize process group."""
-    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
-    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', str(port or 29500))
-    os.environ['RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['LOCAL_RANK'] = str(rank)
-
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=world_size,
-        rank=rank
-    )
-
 
 def setup_directories(config: Config, world_size: int, is_main_process: bool) -> Tuple[Path, Path]:
     """Create output and checkpoint directories."""
@@ -105,28 +76,6 @@ def setup_directories(config: Config, world_size: int, is_main_process: bool) ->
 
     dist.barrier()
     return output_dir, checkpoints_dir
-
-
-def setup_logging_for_rank(config: Config, rank: int, world_size: int, mode_name: str) -> logging.Logger:
-    """Set up logging based on process rank."""
-    is_main_process = (rank == 0)
-
-    if is_main_process:
-        setup_logging(config.logging)
-        log = logging.getLogger(__name__)
-        log.info("=" * 60)
-        log.info(f"{mode_name} (DDP)")
-        log.info("=" * 60)
-        log.info(f"Experiment: {config.experiment_name}")
-        log.info(f"Dataset: {config.data.dataset}")
-        log.info(f"World Size: {world_size}")
-        log.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
-        log.info("=" * 60)
-    else:
-        logging.basicConfig(level=logging.ERROR)
-        log = logging.getLogger(__name__)
-
-    return log
 
 
 def build_model_config(config: Config) -> dict:
