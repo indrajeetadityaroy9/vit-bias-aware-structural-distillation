@@ -15,7 +15,6 @@ Reference: Kornblith et al., "Similarity of Neural Network Representations
 Revisited", ICML 2019.
 """
 
-import logging
 from typing import Dict, List, Optional, Any
 
 import torch
@@ -23,8 +22,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
-
-logger = logging.getLogger(__name__)
 
 
 class CKAAnalyzer:
@@ -196,8 +193,6 @@ class CKAAnalyzer:
 
         inputs = torch.cat(inputs_list, dim=0)[:num_samples].to(self.device)
 
-        logger.info(f"Computing CKA matrix on {len(inputs)} samples...")
-
         # Extract features
         features1 = self._extract_layer_features(self.model1, inputs, layer_indices1)
         if self.model2 is not None:
@@ -223,15 +218,12 @@ class CKAAnalyzer:
 
                 cka_matrix[i, j] = self.compute_cka(feat1, feat2)
 
-        result = {
+        return {
             'cka_matrix': cka_matrix.tolist(),
             'layer_indices_1': layer_indices1,
             'layer_indices_2': layer_indices2,
             'num_samples': len(inputs)
         }
-
-        logger.info(f"CKA matrix computed: {n_layers1}x{n_layers2}")
-        return result
 
 
 __all__ = ['CKAAnalyzer']

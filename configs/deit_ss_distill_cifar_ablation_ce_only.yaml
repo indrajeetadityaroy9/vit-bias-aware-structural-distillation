@@ -31,13 +31,6 @@ experiment_name: deit_ablation_ce_only
 output_dir: ./outputs
 seed: 42
 
-logging:
-  log_dir: ./logs
-  log_level: INFO
-  save_frequency: 10
-  track_grad_norm: true
-  wandb: false
-
 model:
   model_type: deit
   in_channels: 3

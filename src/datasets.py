@@ -2,11 +2,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset, random_split, Subset
 from torchvision import datasets, transforms
 import numpy as np
-import logging
-from PIL import Image, ImageOps
+from PIL import Image
 import random
 
-logger = logging.getLogger(__name__)
 
 class Cutout:
 
@@ -36,6 +34,7 @@ class Cutout:
         img = img * mask
 
         return img
+
 
 class MixingDataset(Dataset):
     """
@@ -112,11 +111,6 @@ class MixingDataset(Dataset):
         return bbx1, bby1, bbx2, bby2
 
 
-# Backward compatibility aliases
-MixUpDataset = lambda dataset, alpha=1.0, num_classes=10: MixingDataset(dataset, 'mixup', alpha, num_classes)
-CutMixDataset = lambda dataset, alpha=1.0, num_classes=10: MixingDataset(dataset, 'cutmix', alpha, num_classes)
-
-
 class DualAugmentDataset(Dataset):
     """
     Dual-path augmentation dataset for self-supervised distillation.
@@ -175,427 +169,319 @@ class DualAugmentDataset(Dataset):
         return clean_img, augmented_img, target
 
 
-class DatasetManager:
+def get_transforms(config, is_train=True):
+    """Build transform pipeline based on config."""
+    dataset = config.data.dataset
+    aug_config = config.data.augmentation if is_train else {}
 
-    @staticmethod
-    def get_transforms(config, is_train=True):
-        dataset = config.data.dataset
-        aug_config = config.data.augmentation if is_train else {}
+    transform_list = []
 
-        transform_list = []
+    if dataset == 'mnist':
+        if is_train and aug_config:
+            if aug_config.get('random_rotation'):
+                transform_list.append(transforms.RandomRotation(10))
+            if aug_config.get('random_affine'):
+                transform_list.append(transforms.RandomAffine(
+                    degrees=0, translate=(0.1, 0.1)
+                ))
+            # RandAugment for MNIST (must be before ToTensor)
+            if aug_config.get('randaugment'):
+                n_ops = aug_config.get('randaugment_n', 2)
+                magnitude = aug_config.get('randaugment_m', 9)
+                transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
 
-        if dataset == 'mnist':
-            if is_train and aug_config:
-                if aug_config.get('random_rotation'):
-                    transform_list.append(transforms.RandomRotation(10))
-                if aug_config.get('random_affine'):
-                    transform_list.append(transforms.RandomAffine(
-                        degrees=0, translate=(0.1, 0.1)
-                    ))
-                # RandAugment for MNIST (must be before ToTensor)
-                if aug_config.get('randaugment'):
-                    n_ops = aug_config.get('randaugment_n', 2)
-                    magnitude = aug_config.get('randaugment_m', 9)
-                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
-
-            transform_list.extend([
-                transforms.Resize((28, 28)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization['mean'],
-                    std=config.data.normalization['std']
-                )
-            ])
-
-            if is_train and aug_config.get('cutout'):
-                transform_list.append(Cutout(n_holes=1, length=8))
-
-        elif dataset == 'cifar':
-            if is_train and aug_config:
-                if aug_config.get('random_crop'):
-                    transform_list.append(transforms.RandomCrop(32, padding=4))
-                if aug_config.get('random_flip'):
-                    transform_list.append(transforms.RandomHorizontalFlip())
-                if aug_config.get('color_jitter'):
-                    transform_list.append(transforms.ColorJitter(
-                        brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2
-                    ))
-                if aug_config.get('auto_augment'):
-                    transform_list.append(transforms.AutoAugment(
-                        transforms.AutoAugmentPolicy.CIFAR10
-                    ))
-                # RandAugment for CIFAR (must be before ToTensor)
-                if aug_config.get('randaugment'):
-                    n_ops = aug_config.get('randaugment_n', 2)
-                    magnitude = aug_config.get('randaugment_m', 9)
-                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
-
-            transform_list.extend([
-                transforms.Resize((32, 32)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization['mean'],
-                    std=config.data.normalization['std']
-                )
-            ])
-
-            if is_train and aug_config.get('cutout'):
-                transform_list.append(Cutout(n_holes=1, length=16))
-
-        else:
-
-            if is_train and aug_config:
-                if aug_config.get('random_crop'):
-                    size = aug_config.get('image_size', 224)
-                    transform_list.append(transforms.RandomResizedCrop(size))
-                if aug_config.get('random_flip'):
-                    transform_list.append(transforms.RandomHorizontalFlip())
-                if aug_config.get('color_jitter'):
-                    transform_list.append(transforms.ColorJitter(
-                        brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
-                    ))
-                # RandAugment for custom datasets (must be before ToTensor)
-                if aug_config.get('randaugment'):
-                    n_ops = aug_config.get('randaugment_n', 2)
-                    magnitude = aug_config.get('randaugment_m', 9)
-                    transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
-
-            size = aug_config.get('image_size', 224)
-            transform_list.extend([
-                transforms.Resize((size, size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization.get('mean', [0.485, 0.456, 0.406]),
-                    std=config.data.normalization.get('std', [0.229, 0.224, 0.225])
-                )
-            ])
-
-        return transforms.Compose(transform_list)
-
-    @staticmethod
-    def get_dataset(config, is_train=True):
-        dataset_name = config.data.dataset
-        transform = DatasetManager.get_transforms(config, is_train)
-
-        if dataset_name == 'mnist':
-            dataset = datasets.MNIST(
-                root=config.data.data_path,
-                train=is_train,
-                download=True,
-                transform=transform
+        transform_list.extend([
+            transforms.Resize((28, 28)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=config.data.normalization['mean'],
+                std=config.data.normalization['std']
             )
-        elif dataset_name == 'cifar':
-            dataset = datasets.CIFAR10(
-                root=config.data.data_path,
-                train=is_train,
-                download=True,
-                transform=transform
+        ])
+
+        if is_train and aug_config.get('cutout'):
+            transform_list.append(Cutout(n_holes=1, length=8))
+
+    elif dataset == 'cifar':
+        if is_train and aug_config:
+            if aug_config.get('random_crop'):
+                transform_list.append(transforms.RandomCrop(32, padding=4))
+            if aug_config.get('random_flip'):
+                transform_list.append(transforms.RandomHorizontalFlip())
+            if aug_config.get('color_jitter'):
+                transform_list.append(transforms.ColorJitter(
+                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2
+                ))
+            if aug_config.get('auto_augment'):
+                transform_list.append(transforms.AutoAugment(
+                    transforms.AutoAugmentPolicy.CIFAR10
+                ))
+            # RandAugment for CIFAR (must be before ToTensor)
+            if aug_config.get('randaugment'):
+                n_ops = aug_config.get('randaugment_n', 2)
+                magnitude = aug_config.get('randaugment_m', 9)
+                transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
+
+        transform_list.extend([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=config.data.normalization['mean'],
+                std=config.data.normalization['std']
             )
-        elif dataset_name == 'fashion_mnist':
-            dataset = datasets.FashionMNIST(
-                root=config.data.data_path,
-                train=is_train,
-                download=True,
-                transform=transform
-            )
-        elif dataset_name == 'svhn':
-            split = 'train' if is_train else 'test'
-            dataset = datasets.SVHN(
-                root=config.data.data_path,
-                split=split,
-                download=True,
-                transform=transform
-            )
-        else:
+        ])
 
-            from torchvision.datasets import ImageFolder
-            data_dir = f"{config.data.data_path}/{dataset_name}"
-            split = 'train' if is_train else 'test'
-            dataset = ImageFolder(
-                root=f"{data_dir}/{split}",
-                transform=transform
-            )
+        if is_train and aug_config.get('cutout'):
+            transform_list.append(Cutout(n_holes=1, length=16))
 
-        if is_train:
-            # Determine num_classes for MixUp/CutMix
-            num_classes = config.model.num_classes if hasattr(config, 'model') and hasattr(config.model, 'num_classes') else 10
-            if config.data.augmentation.get('mixup'):
-                dataset = MixUpDataset(dataset, alpha=config.data.augmentation.get('mixup_alpha', 1.0), num_classes=num_classes)
-            elif config.data.augmentation.get('cutmix'):
-                dataset = CutMixDataset(dataset, alpha=config.data.augmentation.get('cutmix_alpha', 1.0), num_classes=num_classes)
-
-        return dataset
-
-    @staticmethod
-    def create_data_loaders(config, val_split=0.1):
-
-        full_train_dataset = DatasetManager.get_dataset(config, is_train=True)
-
-        train_size = int((1 - val_split) * len(full_train_dataset))
-        val_size = len(full_train_dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            full_train_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(config.seed)
-        )
-
-        test_dataset = DatasetManager.get_dataset(config, is_train=False)
-
-        # H100 optimization: use config drop_last for CUDA Graphs compatibility
-        drop_last = getattr(config.data, 'drop_last', True)
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=True,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
-            drop_last=drop_last
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory
-        )
-
-        logger.info(f"Created data loaders - Train: {len(train_dataset)}, "
-                   f"Val: {len(val_dataset)}, Test: {len(test_dataset)}")
-
-        return train_loader, val_loader, test_loader
-
-    @staticmethod
-    def get_dataset_info(config):
-        dataset = DatasetManager.get_dataset(config, is_train=False)
-        sample, _ = dataset[0]
-
-        if isinstance(sample, (list, tuple)):
-            sample = sample[0]
-
-        if not torch.is_tensor(sample):
-            sample = transforms.ToTensor()(sample)
-
-        if sample.dim() == 2:
-            sample = sample.unsqueeze(0)
-
-        in_channels = sample.shape[0]
-        image_size = sample.shape[-1]
-
-        if hasattr(dataset, 'classes') and dataset.classes:
-            classes = list(dataset.classes)
-        elif hasattr(dataset, 'class_to_idx') and dataset.class_to_idx:
-            classes = [name for name, _ in sorted(dataset.class_to_idx.items(), key=lambda item: item[1])]
-        else:
-            raw_targets = None
-            if hasattr(dataset, 'targets'):
-                raw_targets = dataset.targets
-            elif hasattr(dataset, 'labels'):
-                raw_targets = dataset.labels
-
-            if raw_targets is None:
-                num_classes = getattr(config.model, 'num_classes', None)
-                if num_classes is None:
-                    raise ValueError(f"Unable to determine class count for dataset {config.data.dataset}")
-                classes = [str(i) for i in range(num_classes)]
-            else:
-                if isinstance(raw_targets, torch.Tensor):
-                    raw_targets = raw_targets.tolist()
-                elif isinstance(raw_targets, np.ndarray):
-                    raw_targets = raw_targets.tolist()
-                num_classes = len(set(raw_targets))
-                classes = [str(i) for i in range(num_classes)]
-
-        num_classes = len(classes)
-
-        return {
-            'num_classes': num_classes,
-            'in_channels': in_channels,
-            'image_size': image_size,
-            'classes': classes
-        }
-
-    @staticmethod
-    def get_dual_augment_dataset(config):
-        """
-        Create a DualAugmentDataset for self-supervised distillation.
-
-        Returns dataset that yields (clean_img, augmented_img, target) tuples.
-        - clean_img: Minimal preprocessing for teacher (DINOv2)
-        - augmented_img: Full augmentation for student (DeiT)
-        - target: Integer class label (MixUp applied in training loop)
-
-        Args:
-            config: Configuration object
-
-        Returns:
-            DualAugmentDataset instance
-        """
-        dataset_name = config.data.dataset
-
-        # Get raw dataset without transforms
-        if dataset_name == 'mnist':
-            base_dataset = datasets.MNIST(
-                root=config.data.data_path,
-                train=True,
-                download=True,
-                transform=None  # Raw PIL images
-            )
-        elif dataset_name == 'cifar':
-            base_dataset = datasets.CIFAR10(
-                root=config.data.data_path,
-                train=True,
-                download=True,
-                transform=None  # Raw PIL images
-            )
-        elif dataset_name == 'fashion_mnist':
-            base_dataset = datasets.FashionMNIST(
-                root=config.data.data_path,
-                train=True,
-                download=True,
-                transform=None
-            )
-        elif dataset_name == 'svhn':
-            base_dataset = datasets.SVHN(
-                root=config.data.data_path,
-                split='train',
-                download=True,
-                transform=None
-            )
-        else:
-            from torchvision.datasets import ImageFolder
-            data_dir = f"{config.data.data_path}/{dataset_name}"
-            base_dataset = ImageFolder(
-                root=f"{data_dir}/train",
-                transform=None
-            )
-
-        # Get transforms - clean uses is_train=False for minimal preprocessing
-        clean_transform = DatasetManager.get_transforms(config, is_train=False)
-        student_transform = DatasetManager.get_transforms(config, is_train=True)
-
-        # Create dual augment dataset
-        dual_dataset = DualAugmentDataset(
-            base_dataset=base_dataset,
-            clean_transform=clean_transform,
-            student_transform=student_transform
-        )
-
-        logger.info(
-            f"Created DualAugmentDataset for {dataset_name}: "
-            f"{len(dual_dataset)} samples (clean + augmented paths)"
-        )
-
-        return dual_dataset
-
-    @staticmethod
-    def create_dual_augment_loaders(config, val_split=0.1):
-        """
-        Create data loaders for dual-path augmentation training.
-
-        Returns train_loader that yields (clean_imgs, augmented_imgs, targets).
-        Returns val_loader that yields standard (img, target) 2-tuples for compatibility
-        with DDPTrainer.validate_ddp().
-
-        Args:
-            config: Configuration object
-            val_split: Fraction for validation set
-
-        Returns:
-            train_loader, val_loader, test_loader
-        """
-        # Get dual augment training dataset
-        full_train_dataset = DatasetManager.get_dual_augment_dataset(config)
-
-        # Split into train/val indices
-        total_size = len(full_train_dataset)
-        train_size = int((1 - val_split) * total_size)
-        val_size = total_size - train_size
-
-        # Generate consistent indices using seeded generator
-        generator = torch.Generator().manual_seed(config.seed)
-        indices = torch.randperm(total_size, generator=generator).tolist()
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
-
-        # Train dataset uses DualAugment (3-tuple: clean, augmented, target)
-        train_dataset = Subset(full_train_dataset, train_indices)
-
-        # Validation dataset uses standard single-path transform (2-tuple: img, target)
-        # This ensures compatibility with DDPTrainer.validate_ddp()
-        standard_train_dataset = DatasetManager.get_dataset(config, is_train=False)
-        val_dataset = Subset(standard_train_dataset, val_indices)
-
-        # Test dataset uses standard single-path transform
-        test_dataset = DatasetManager.get_dataset(config, is_train=False)
-
-        # H100 optimization: use config drop_last for CUDA Graphs compatibility
-        drop_last = getattr(config.data, 'drop_last', True)
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=True,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
-            drop_last=drop_last
-        )
-
-        # Validation uses standard 2-tuple format (img, target) for DDPTrainer compatibility
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory
-        )
-
-        logger.info(
-            f"Created dual-augment data loaders - Train: {len(train_dataset)} (3-tuple), "
-            f"Val: {len(val_dataset)} (2-tuple), Test: {len(test_dataset)}"
-        )
-
-        return train_loader, val_loader, test_loader
-
-
-def preprocess_image(image_path, config):
-    image = Image.open(image_path)
-
-    dataset_info = DatasetManager.get_dataset_info(config)
-    if dataset_info['in_channels'] == 1:
-        image = image.convert('L')
-
-        if config.data.dataset == 'mnist':
-            image_np = np.array(image)
-            if image_np.mean() > 127:
-                image = ImageOps.invert(image)
     else:
-        image = image.convert('RGB')
 
-    transform = DatasetManager.get_transforms(config, is_train=False)
-    image = transform(image).unsqueeze(0)
+        if is_train and aug_config:
+            if aug_config.get('random_crop'):
+                size = aug_config.get('image_size', 224)
+                transform_list.append(transforms.RandomResizedCrop(size))
+            if aug_config.get('random_flip'):
+                transform_list.append(transforms.RandomHorizontalFlip())
+            if aug_config.get('color_jitter'):
+                transform_list.append(transforms.ColorJitter(
+                    brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
+                ))
+            # RandAugment for custom datasets (must be before ToTensor)
+            if aug_config.get('randaugment'):
+                n_ops = aug_config.get('randaugment_n', 2)
+                magnitude = aug_config.get('randaugment_m', 9)
+                transform_list.append(transforms.RandAugment(num_ops=n_ops, magnitude=magnitude))
 
-    return image
+        size = aug_config.get('image_size', 224)
+        transform_list.extend([
+            transforms.Resize((size, size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=config.data.normalization.get('mean', [0.485, 0.456, 0.406]),
+                std=config.data.normalization.get('std', [0.229, 0.224, 0.225])
+            )
+        ])
+
+    return transforms.Compose(transform_list)
+
+
+def get_dataset(config, is_train=True):
+    """Load dataset with transforms applied."""
+    dataset_name = config.data.dataset
+    transform = get_transforms(config, is_train)
+
+    if dataset_name == 'mnist':
+        dataset = datasets.MNIST(
+            root=config.data.data_path,
+            train=is_train,
+            download=True,
+            transform=transform
+        )
+    elif dataset_name == 'cifar':
+        dataset = datasets.CIFAR10(
+            root=config.data.data_path,
+            train=is_train,
+            download=True,
+            transform=transform
+        )
+    elif dataset_name == 'fashion_mnist':
+        dataset = datasets.FashionMNIST(
+            root=config.data.data_path,
+            train=is_train,
+            download=True,
+            transform=transform
+        )
+    elif dataset_name == 'svhn':
+        split = 'train' if is_train else 'test'
+        dataset = datasets.SVHN(
+            root=config.data.data_path,
+            split=split,
+            download=True,
+            transform=transform
+        )
+    else:
+
+        from torchvision.datasets import ImageFolder
+        data_dir = f"{config.data.data_path}/{dataset_name}"
+        split = 'train' if is_train else 'test'
+        dataset = ImageFolder(
+            root=f"{data_dir}/{split}",
+            transform=transform
+        )
+
+    if is_train:
+        # Determine num_classes for MixUp/CutMix
+        num_classes = config.model.num_classes if hasattr(config, 'model') and hasattr(config.model, 'num_classes') else 10
+        if config.data.augmentation.get('mixup'):
+            dataset = MixingDataset(dataset, 'mixup', alpha=config.data.augmentation.get('mixup_alpha', 1.0), num_classes=num_classes)
+        elif config.data.augmentation.get('cutmix'):
+            dataset = MixingDataset(dataset, 'cutmix', alpha=config.data.augmentation.get('cutmix_alpha', 1.0), num_classes=num_classes)
+
+    return dataset
+
+
+def create_data_loaders(config, val_split=0.1):
+    """Create train/val/test data loaders."""
+    full_train_dataset = get_dataset(config, is_train=True)
+
+    train_size = int((1 - val_split) * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = random_split(
+        full_train_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed)
+    )
+
+    test_dataset = get_dataset(config, is_train=False)
+
+    # H100 optimization: use config drop_last for CUDA Graphs compatibility
+    drop_last = getattr(config.data, 'drop_last', True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
+        drop_last=drop_last
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory
+    )
+
+    print(f"data train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
+
+    return train_loader, val_loader, test_loader
+
+
+def get_dataset_info(config):
+    """Get dataset metadata (num_classes, channels, image_size, class names)."""
+    dataset = get_dataset(config, is_train=False)
+    sample, _ = dataset[0]
+
+    if isinstance(sample, (list, tuple)):
+        sample = sample[0]
+
+    if not torch.is_tensor(sample):
+        sample = transforms.ToTensor()(sample)
+
+    if sample.dim() == 2:
+        sample = sample.unsqueeze(0)
+
+    in_channels = sample.shape[0]
+    image_size = sample.shape[-1]
+
+    if hasattr(dataset, 'classes') and dataset.classes:
+        classes = list(dataset.classes)
+    elif hasattr(dataset, 'class_to_idx') and dataset.class_to_idx:
+        classes = [name for name, _ in sorted(dataset.class_to_idx.items(), key=lambda item: item[1])]
+    else:
+        raw_targets = None
+        if hasattr(dataset, 'targets'):
+            raw_targets = dataset.targets
+        elif hasattr(dataset, 'labels'):
+            raw_targets = dataset.labels
+
+        if raw_targets is None:
+            num_classes = getattr(config.model, 'num_classes', None)
+            if num_classes is None:
+                raise ValueError(f"Unable to determine class count for dataset {config.data.dataset}")
+            classes = [str(i) for i in range(num_classes)]
+        else:
+            if isinstance(raw_targets, torch.Tensor):
+                raw_targets = raw_targets.tolist()
+            elif isinstance(raw_targets, np.ndarray):
+                raw_targets = raw_targets.tolist()
+            num_classes = len(set(raw_targets))
+            classes = [str(i) for i in range(num_classes)]
+
+    num_classes = len(classes)
+
+    return {
+        'num_classes': num_classes,
+        'in_channels': in_channels,
+        'image_size': image_size,
+        'classes': classes
+    }
+
+
+def get_dual_augment_dataset(config):
+    """
+    Create a DualAugmentDataset for self-supervised distillation.
+
+    Returns dataset that yields (clean_img, augmented_img, target) tuples.
+    - clean_img: Minimal preprocessing for teacher (DINOv2)
+    - augmented_img: Full augmentation for student (DeiT)
+    - target: Integer class label (MixUp applied in training loop)
+    """
+    dataset_name = config.data.dataset
+
+    # Get raw dataset without transforms
+    if dataset_name == 'mnist':
+        base_dataset = datasets.MNIST(
+            root=config.data.data_path,
+            train=True,
+            download=True,
+            transform=None  # Raw PIL images
+        )
+    elif dataset_name == 'cifar':
+        base_dataset = datasets.CIFAR10(
+            root=config.data.data_path,
+            train=True,
+            download=True,
+            transform=None  # Raw PIL images
+        )
+    elif dataset_name == 'fashion_mnist':
+        base_dataset = datasets.FashionMNIST(
+            root=config.data.data_path,
+            train=True,
+            download=True,
+            transform=None
+        )
+    elif dataset_name == 'svhn':
+        base_dataset = datasets.SVHN(
+            root=config.data.data_path,
+            split='train',
+            download=True,
+            transform=None
+        )
+    else:
+        from torchvision.datasets import ImageFolder
+        data_dir = f"{config.data.data_path}/{dataset_name}"
+        base_dataset = ImageFolder(
+            root=f"{data_dir}/train",
+            transform=None
+        )
+
+    # Get transforms - clean uses is_train=False for minimal preprocessing
+    clean_transform = get_transforms(config, is_train=False)
+    student_transform = get_transforms(config, is_train=True)
+
+    # Create dual augment dataset
+    dual_dataset = DualAugmentDataset(
+        base_dataset=base_dataset,
+        clean_transform=clean_transform,
+        student_transform=student_transform
+    )
+
+    print(f"data dual_augment={dataset_name} samples={len(dual_dataset)}")
+
+    return dual_dataset
+
+

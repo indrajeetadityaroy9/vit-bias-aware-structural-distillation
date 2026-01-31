@@ -11,11 +11,6 @@ These tests verify:
 import pytest
 import torch
 import torch.nn.functional as F
-import sys
-import os
-
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestTokenCorrelationLoss:
@@ -156,56 +151,6 @@ class TestCheckpointRNGState:
         assert 'torch' in checkpoint['rng_state'], "Missing torch RNG state"
         assert 'numpy' in checkpoint['rng_state'], "Missing numpy RNG state"
         assert 'python' in checkpoint['rng_state'], "Missing python RNG state"
-
-    def test_rng_state_restore(self):
-        """Verify RNG state can be restored."""
-        from src.training import build_checkpoint_dict, restore_rng_state
-        import random
-        import numpy as np
-
-        # Set specific seeds
-        random.seed(42)
-        np.random.seed(42)
-        torch.manual_seed(42)
-
-        # Generate some random numbers
-        before_python = random.random()
-        before_numpy = np.random.rand()
-        before_torch = torch.rand(1).item()
-
-        # Create checkpoint with current RNG state
-        model = torch.nn.Linear(10, 10)
-        optimizer = torch.optim.Adam(model.parameters())
-        checkpoint = build_checkpoint_dict(
-            model=model,
-            optimizer=optimizer,
-            scheduler=None,
-            scaler=None,
-            swa_model=None,
-            epoch=0,
-            metrics={},
-            config=None,
-            best_val_acc=0,
-            metrics_history={}
-        )
-
-        # Generate more random numbers (changes state)
-        _ = random.random()
-        _ = np.random.rand()
-        _ = torch.rand(1)
-
-        # Restore RNG state
-        restore_rng_state(checkpoint)
-
-        # Generate numbers again - should match what we'd get after the checkpoint
-        after_python = random.random()
-        after_numpy = np.random.rand()
-        after_torch = torch.rand(1).item()
-
-        # The values after restore should be different from before
-        # (they continue from the checkpoint state, not from seed 42)
-        # This test just ensures no errors occur during restore
-        assert True, "RNG state restoration completed without error"
 
 
 class TestSeedFunction:

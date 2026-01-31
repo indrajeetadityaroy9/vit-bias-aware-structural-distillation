@@ -11,15 +11,12 @@ Expected results:
 Reference: Dosovitskiy et al., "An Image is Worth 16x16 Words", ICLR 2021.
 """
 
-import logging
 from typing import Dict, List, Optional, Any
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 class AttentionDistanceAnalyzer:
@@ -155,13 +152,10 @@ class AttentionDistanceAnalyzer:
 
         inputs = torch.cat(inputs_list, dim=0)[:num_samples].to(self.device)
 
-        logger.info(f"Computing mean attention distance on {len(inputs)} samples...")
-
         # Get attention weights
         attention_weights = self._extract_attention_weights(inputs)
 
         if not attention_weights:
-            logger.warning("No attention weights captured. Model may not support attention extraction.")
             return {'error': 'No attention weights captured'}
 
         # Compute mean distance per layer
@@ -186,18 +180,12 @@ class AttentionDistanceAnalyzer:
         # Overall mean
         overall_mean = np.mean(list(layer_distances.values()))
 
-        result = {
+        return {
             'layer_distances': layer_distances,
             'mean_distance': overall_mean,
             'num_layers': len(layer_distances),
             'num_samples': len(inputs)
         }
-
-        logger.info(f"Mean attention distance: {overall_mean:.4f}")
-        for layer, dist in layer_distances.items():
-            logger.info(f"  {layer}: {dist:.4f}")
-
-        return result
 
     def compute_head_statistics(
         self,
@@ -237,10 +225,7 @@ class AttentionDistanceAnalyzer:
         num_special = N_total - N_patches
 
         if num_special < 1:
-            logger.warning(f"Invalid attention shape: N_total={N_total}, grid_size={grid_size}")
             num_special = 1
-        elif num_special > 2:
-            logger.warning(f"Unusual number of special tokens: {num_special}")
 
         # 1. Patch-to-Patch Mean Attention Distance
         patch_attn = attn_weights[:, :, num_special:, num_special:]

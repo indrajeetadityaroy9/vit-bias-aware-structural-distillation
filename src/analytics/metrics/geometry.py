@@ -11,9 +11,10 @@ Expected results:
 - DINO-distilled: Low trace (flat landscape, good generalization)
 
 Reference: Ghorbani et al., "Spaced Knowledge Distillation", NeurIPS 2020.
+
+Requires: pip install git+https://github.com/amirgholami/PyHessian.git
 """
 
-import logging
 from typing import Dict, Any, Tuple
 
 import torch
@@ -21,7 +22,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
-logger = logging.getLogger(__name__)
+try:
+    from pyhessian import hessian
+except ImportError:
+    hessian = None
 
 
 class HessianAnalyzer:
@@ -53,9 +57,7 @@ class HessianAnalyzer:
         self.num_samples = num_samples
         self.batch_size = batch_size
 
-        # Unwrap compiled model if necessary
         if hasattr(model, '_orig_mod'):
-            logger.info("Unwrapping torch.compile model for Hessian analysis")
             self.model = model._orig_mod
 
         self.model.eval()
@@ -92,15 +94,13 @@ class HessianAnalyzer:
         Returns:
             Dict with 'trace', 'trace_std' (standard deviation across iterations)
         """
-        try:
-            from pyhessian import hessian
-        except ImportError:
-            logger.error("pyhessian not installed. Install with: pip install pyhessian")
-            return {'trace': float('nan'), 'trace_std': float('nan'), 'error': 'pyhessian not installed'}
+        if hessian is None:
+            raise ImportError(
+                "pyhessian required for Hessian analysis. "
+                "Install with: pip install git+https://github.com/amirgholami/PyHessian.git"
+            )
 
         inputs, targets = self._prepare_data(dataloader)
-
-        logger.info(f"Computing Hessian trace on {len(inputs)} samples...")
 
         # Create Hessian computer
         hessian_comp = hessian(
@@ -113,14 +113,11 @@ class HessianAnalyzer:
         # Compute trace using Hutchinson's estimator
         trace, trace_std = hessian_comp.trace(maxIter=50, tol=1e-3)
 
-        result = {
+        return {
             'trace': float(np.mean(trace)),
             'trace_std': float(trace_std) if trace_std is not None else 0.0,
             'num_samples': len(inputs)
         }
-
-        logger.info(f"Hessian trace: {result['trace']:.4f} +/- {result['trace_std']:.4f}")
-        return result
 
     def compute_top_eigenvalues(
         self,
@@ -137,15 +134,13 @@ class HessianAnalyzer:
         Returns:
             Dict with 'eigenvalues', 'eigenvalue_ratio' (max/min ratio)
         """
-        try:
-            from pyhessian import hessian
-        except ImportError:
-            logger.error("pyhessian not installed")
-            return {'eigenvalues': [], 'error': 'pyhessian not installed'}
+        if hessian is None:
+            raise ImportError(
+                "pyhessian required for Hessian analysis. "
+                "Install with: pip install git+https://github.com/amirgholami/PyHessian.git"
+            )
 
         inputs, targets = self._prepare_data(dataloader)
-
-        logger.info(f"Computing top {top_n} Hessian eigenvalues...")
 
         hessian_comp = hessian(
             self.model,
@@ -160,16 +155,12 @@ class HessianAnalyzer:
         eigenvalues = [float(e) for e in top_eigenvalues]
         ratio = eigenvalues[0] / (eigenvalues[-1] + 1e-10) if len(eigenvalues) > 1 else 1.0
 
-        result = {
+        return {
             'eigenvalues': eigenvalues,
             'max_eigenvalue': eigenvalues[0] if eigenvalues else 0.0,
             'eigenvalue_ratio': ratio,
             'num_samples': len(inputs)
         }
-
-        logger.info(f"Top eigenvalues: {eigenvalues}")
-        logger.info(f"Eigenvalue ratio (max/min): {ratio:.2f}")
-        return result
 
     def run_full_analysis(self, dataloader: DataLoader) -> Dict[str, Any]:
         """Run complete Hessian analysis."""
@@ -186,79 +177,6 @@ class HessianAnalyzer:
         results['eigenvalue_ratio'] = eigen_results['eigenvalue_ratio']
 
         return results
-
-    def compute_trace_distributed(
-        self,
-        dataloader: DataLoader,
-        rank: int,
-        world_size: int
-    ) -> Dict[str, float]:
-        """
-        Compute Hessian trace with distributed aggregation across GPUs.
-
-        The Hutchinson method estimates trace by averaging separate Monte Carlo
-        samples. This is trivially parallelizable - each GPU computes local
-        samples and results are aggregated.
-
-        Args:
-            dataloader: Data for Hessian computation
-            rank: Current process rank
-            world_size: Total number of processes
-
-        Returns:
-            Dict with 'trace', 'trace_std', aggregated across all GPUs
-        """
-        import torch.distributed as dist
-
-        try:
-            from pyhessian import hessian
-        except ImportError:
-            logger.error("pyhessian not installed")
-            return {'trace': float('nan'), 'trace_std': float('nan')}
-
-        # Each GPU uses subset of samples
-        local_num_samples = self.num_samples // world_size
-        inputs, targets = self._prepare_data(dataloader)
-
-        # Slice for this rank
-        start_idx = rank * local_num_samples
-        end_idx = min(start_idx + local_num_samples, len(inputs))
-        local_inputs = inputs[start_idx:end_idx]
-        local_targets = targets[start_idx:end_idx]
-
-        if rank == 0:
-            logger.info(f"Computing distributed Hessian trace: "
-                       f"{local_num_samples} samples per GPU, {world_size} GPUs")
-
-        # Compute local trace
-        hessian_comp = hessian(
-            self.model,
-            self.criterion,
-            data=(local_inputs, local_targets),
-            cuda=self.device.type == 'cuda'
-        )
-
-        # Fewer iterations per GPU since we aggregate
-        local_trace, _ = hessian_comp.trace(maxIter=max(10, 50 // world_size), tol=1e-3)
-        local_trace_mean = float(np.mean(local_trace))
-
-        # Aggregate across GPUs
-        trace_tensor = torch.tensor([local_trace_mean], device=self.device)
-        dist.all_reduce(trace_tensor, op=dist.ReduceOp.SUM)
-        global_trace = trace_tensor.item() / world_size
-
-        result = {
-            'trace': global_trace,
-            'trace_std': 0.0,  # Would need additional sync for std
-            'num_samples': self.num_samples,
-            'distributed': True,
-            'world_size': world_size
-        }
-
-        if rank == 0:
-            logger.info(f"Distributed Hessian trace: {result['trace']:.4f}")
-
-        return result
 
 
 __all__ = ['HessianAnalyzer']

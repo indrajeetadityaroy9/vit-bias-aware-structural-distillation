@@ -10,11 +10,8 @@ Import this module to register:
 from . import adaptive  # Registers 'adaptive_cnn'
 from . import resnet    # Registers 'resnet18_cifar'
 
-# ConvNeXt is optional (requires timm)
-try:
-    from . import convnext  # Registers 'convnext_v2_tiny' if timm available
-except ImportError:
-    pass
+# ConvNeXt requires timm
+from . import convnext  # Registers 'convnext_v2_tiny'
 
 # Note: We don't re-export model classes to avoid circular imports
 # Use create_model('model_name', config) instead

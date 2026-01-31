@@ -3,16 +3,12 @@ Checkpoint utilities for training state persistence.
 
 Provides:
 - build_checkpoint_dict: Create checkpoint dictionary
-- restore_rng_state: Restore RNG states for reproducible resume
 """
 
 import random
-import logging
 
 import torch
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
@@ -50,7 +46,7 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
     # Save RNG states for reproducible resume
     checkpoint['rng_state'] = {
         'torch': torch.get_rng_state(),
-        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'torch_cuda': torch.cuda.get_rng_state_all(),
         'numpy': np.random.get_state(),
         'python': random.getstate()
     }
@@ -70,32 +66,4 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
     return checkpoint
 
 
-def restore_rng_state(checkpoint):
-    """
-    Restore RNG states from checkpoint for reproducible resume.
-
-    Args:
-        checkpoint: Checkpoint dictionary with 'rng_state' key
-    """
-    if 'rng_state' not in checkpoint:
-        logger.warning("Checkpoint does not contain RNG state - resume may not be reproducible")
-        return
-
-    rng_state = checkpoint['rng_state']
-
-    if 'torch' in rng_state:
-        torch.set_rng_state(rng_state['torch'])
-
-    if 'torch_cuda' in rng_state and rng_state['torch_cuda'] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
-
-    if 'numpy' in rng_state:
-        np.random.set_state(rng_state['numpy'])
-
-    if 'python' in rng_state:
-        random.setstate(rng_state['python'])
-
-    logger.info("Restored RNG state from checkpoint")
-
-
-__all__ = ['build_checkpoint_dict', 'restore_rng_state']
+__all__ = ['build_checkpoint_dict']

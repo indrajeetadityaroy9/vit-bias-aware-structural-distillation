@@ -6,12 +6,8 @@ Provides:
 - LabelSmoothingCrossEntropy: Smooth label loss function
 """
 
-import logging
-
 import torch
 import torch.nn as nn
-
-logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
@@ -41,7 +37,6 @@ class EarlyStopping:
             self.best_score = score
         elif score < self.best_score + self.min_delta:
             self.counter += 1
-            logger.info(f'EarlyStopping counter: {self.counter}/{self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:

@@ -14,10 +14,7 @@ Usage:
     # Create model:
     model = create_model('my_model', config)
 """
-import logging
 from typing import Any, Callable, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 # Global model registry
 _MODEL_REGISTRY: Dict[str, Callable] = {}
@@ -40,9 +37,8 @@ def register_model(name: str):
     """
     def decorator(cls_or_fn: Callable) -> Callable:
         if name in _MODEL_REGISTRY:
-            logger.warning(f"Model '{name}' already registered. Overwriting.")
+            print(f"Model '{name}' already registered. Overwriting.")
         _MODEL_REGISTRY[name] = cls_or_fn
-        logger.debug(f"Registered model: {name}")
         return cls_or_fn
     return decorator
 
@@ -78,15 +74,3 @@ def list_models() -> List[str]:
         List of registered model names
     """
     return list(_MODEL_REGISTRY.keys())
-
-
-def is_model_registered(name: str) -> bool:
-    """Check if a model is registered.
-
-    Args:
-        name: Model name to check
-
-    Returns:
-        True if registered, False otherwise
-    """
-    return name in _MODEL_REGISTRY

@@ -8,12 +8,9 @@ Supports two-layer config merging:
 Specific config values override global defaults.
 """
 import json
-import logging
 import yaml
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-logger = logging.getLogger(__name__)
 
 
 class DataConfig:
@@ -21,9 +18,7 @@ class DataConfig:
 
     def __init__(self, dataset=None, batch_size=64, num_workers=4, pin_memory=True,
                  persistent_workers=True, prefetch_factor=2, augmentation=None,
-                 normalization=None, data_path="./data",
-                 # H100 optimizations
-                 gpu_augmentation=True, drop_last=True):
+                 normalization=None, data_path="./data", drop_last=True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -33,9 +28,7 @@ class DataConfig:
         self.augmentation = augmentation if augmentation is not None else {}
         self.normalization = normalization if normalization is not None else {}
         self.data_path = data_path
-        # H100 optimizations
-        self.gpu_augmentation = gpu_augmentation  # Apply MixUp/CutMix on GPU
-        self.drop_last = drop_last  # Drop last incomplete batch (required for CUDA Graphs)
+        self.drop_last = drop_last
 
 
 class ModelConfig:
@@ -61,13 +54,13 @@ class TrainingConfig:
     def __init__(self, num_epochs=10, learning_rate=0.001, weight_decay=0.0005,
                  optimizer="adamw", scheduler="cosine", warmup_epochs=5,
                  gradient_clip_val=1.0, gradient_accumulation_steps=1,
-                 use_amp=True, amp_backend="native", early_stopping=True,
+                 use_amp=True, early_stopping=True,
                  early_stopping_patience=10, early_stopping_min_delta=0.001,
                  lr_scheduler_params=None, label_smoothing=0.1, use_swa=True,
                  swa_start_epoch=0.75, swa_lr=0.0005,
                  # H100 optimization flags
                  use_bf16=True, use_compile=True, compile_mode='max-autotune',
-                 use_fused_optimizer=True, use_tf32=True, use_cuda_graphs=False):
+                 use_fused_optimizer=True, use_tf32=True):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -77,7 +70,6 @@ class TrainingConfig:
         self.gradient_clip_val = gradient_clip_val
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.use_amp = use_amp
-        self.amp_backend = amp_backend
         self.early_stopping = early_stopping
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
@@ -92,22 +84,6 @@ class TrainingConfig:
         self.compile_mode = compile_mode  # 'max-autotune', 'reduce-overhead', or 'default'
         self.use_fused_optimizer = use_fused_optimizer  # Use fused AdamW/SGD kernels
         self.use_tf32 = use_tf32  # Enable TF32 for matmul operations
-        self.use_cuda_graphs = use_cuda_graphs  # Enable CUDA Graphs for kernel launch optimization
-
-
-class LoggingConfig:
-    """Logging and experiment tracking configuration."""
-
-    def __init__(self, log_level="INFO", log_dir="./logs", wandb=False,
-                 wandb_project="adaptive-cnn", wandb_entity=None,
-                 save_frequency=5, track_grad_norm=True):
-        self.log_level = log_level
-        self.log_dir = log_dir
-        self.wandb = wandb
-        self.wandb_project = wandb_project
-        self.wandb_entity = wandb_entity
-        self.save_frequency = save_frequency
-        self.track_grad_norm = track_grad_norm
 
 
 class ViTConfig:
@@ -257,13 +233,12 @@ class SelfSupervisedDistillationConfig:
 class Config:
     """Main configuration container."""
 
-    def __init__(self, data=None, model=None, training=None, logging=None,
+    def __init__(self, data=None, model=None, training=None,
                  vit=None, distillation=None, ss_distillation=None,
                  experiment_name="default", seed=42, device="cuda", output_dir="./outputs"):
         self.data = data
         self.model = model
         self.training = training
-        self.logging = logging
         self.vit = vit  # ViT-specific configuration
         self.distillation = distillation  # Knowledge distillation configuration
         self.ss_distillation = ss_distillation  # Self-supervised distillation (CST-style)
@@ -273,286 +248,171 @@ class Config:
         self.output_dir = output_dir
 
 
-class ConfigManager:
-    """Configuration loading, validation, and saving utilities."""
+# Module-level config functions (formerly ConfigManager methods)
 
-    @staticmethod
-    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-        """Deep merge two dictionaries, override takes precedence.
-
-        Args:
-            base: Base dictionary (defaults)
-            override: Override dictionary (specific config)
-
-        Returns:
-            Merged dictionary
-        """
-        result = base.copy()
-        for key, value in override.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = ConfigManager._deep_merge(result[key], value)
-            else:
-                result[key] = value
-        return result
-
-    @staticmethod
-    def _find_defaults_path(config_path: Path) -> Optional[Path]:
-        """Find the global defaults.yaml by walking up to configs/ root.
-
-        Args:
-            config_path: Path to specific config file
-
-        Returns:
-            Path to defaults.yaml if found, None otherwise
-        """
-        defaults_path = config_path.parent
-        while defaults_path.name != 'configs' and defaults_path.parent != defaults_path:
-            defaults_path = defaults_path.parent
-
-        # Check if we found configs/ directory
-        if defaults_path.name == 'configs':
-            potential_defaults = defaults_path / 'defaults.yaml'
-            if potential_defaults.exists():
-                return potential_defaults
-
-        return None
-
-    @staticmethod
-    def load_config(config_path, merge_defaults: bool = True) -> Config:
-        """Load configuration with optional two-layer defaults merging.
-
-        Two-layer merge (explicit > implicit):
-        1. Load global defaults from configs/defaults.yaml (if exists)
-        2. Deep merge with specific config (specific values override defaults)
-
-        Args:
-            config_path: Path to configuration file
-            merge_defaults: Whether to merge with defaults.yaml (default: True)
-
-        Returns:
-            Parsed Config object
-        """
-        config_path = Path(config_path)
-
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-
-        # Load specific config
-        if config_path.suffix in ['.yml', '.yaml']:
-            with open(config_path, 'r') as f:
-                raw_config = yaml.safe_load(f) or {}
-        elif config_path.suffix == '.json':
-            with open(config_path, 'r') as f:
-                raw_config = json.load(f)
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep merge two dictionaries, override takes precedence."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
         else:
-            raise ValueError(f"Unsupported config format: {config_path.suffix}")
+            result[key] = value
+    return result
 
-        # Two-layer merge: defaults.yaml + specific.yaml
-        if merge_defaults:
-            defaults_path = ConfigManager._find_defaults_path(config_path)
-            if defaults_path:
-                with open(defaults_path, 'r') as f:
-                    defaults_config = yaml.safe_load(f) or {}
-                raw_config = ConfigManager._deep_merge(defaults_config, raw_config)
-                logger.info(f"Merged defaults from {defaults_path}")
 
-        return ConfigManager._parse_config(raw_config, config_path)
+def _find_defaults_path(config_path: Path) -> Optional[Path]:
+    """Find the global defaults.yaml by walking up to configs/ root."""
+    defaults_path = config_path.parent
+    while defaults_path.name != 'configs' and defaults_path.parent != defaults_path:
+        defaults_path = defaults_path.parent
 
-    @staticmethod
-    def _parse_config(raw_config: Dict[str, Any], config_path: Optional[Path] = None) -> Config:
-        """Parse raw config dictionary into Config object.
+    # Check if we found configs/ directory
+    if defaults_path.name == 'configs':
+        potential_defaults = defaults_path / 'defaults.yaml'
+        if potential_defaults.exists():
+            return potential_defaults
 
-        Args:
-            raw_config: Raw configuration dictionary
-            config_path: Optional path for logging
+    return None
 
-        Returns:
-            Parsed Config object
-        """
-        # Parse optional vit and distillation configs
-        vit_config = None
-        if 'vit' in raw_config:
-            vit_config = ViTConfig(**raw_config['vit'])
 
-        distillation_config = None
-        if 'distillation' in raw_config:
-            distillation_config = DistillationConfig(**raw_config['distillation'])
+def _parse_config(raw_config: Dict[str, Any], config_path: Optional[Path] = None) -> Config:
+    """Parse raw config dictionary into Config object."""
+    # Parse optional vit and distillation configs
+    vit_config = None
+    if 'vit' in raw_config:
+        vit_config = ViTConfig(**raw_config['vit'])
 
-        ss_distillation_config = None
-        if 'ss_distillation' in raw_config:
-            ss_distillation_config = SelfSupervisedDistillationConfig(**raw_config['ss_distillation'])
+    distillation_config = None
+    if 'distillation' in raw_config:
+        distillation_config = DistillationConfig(**raw_config['distillation'])
 
-        config = Config(
-            data=DataConfig(**raw_config.get('data', {})),
-            model=ModelConfig(**raw_config.get('model', {})),
-            training=TrainingConfig(**raw_config.get('training', {})),
-            logging=LoggingConfig(**raw_config.get('logging', {})),
-            vit=vit_config,
-            distillation=distillation_config,
-            ss_distillation=ss_distillation_config,
-            **{k: v for k, v in raw_config.items()
-               if k not in ['data', 'model', 'training', 'logging', 'vit', 'distillation', 'ss_distillation']}
+    ss_distillation_config = None
+    if 'ss_distillation' in raw_config:
+        ss_distillation_config = SelfSupervisedDistillationConfig(**raw_config['ss_distillation'])
+
+    config = Config(
+        data=DataConfig(**raw_config.get('data', {})),
+        model=ModelConfig(**raw_config.get('model', {})),
+        training=TrainingConfig(**raw_config.get('training', {})),
+        vit=vit_config,
+        distillation=distillation_config,
+        ss_distillation=ss_distillation_config,
+        **{k: v for k, v in raw_config.items()
+           if k not in ['data', 'model', 'training', 'logging', 'vit', 'distillation', 'ss_distillation']}
+    )
+
+    validate_config(config)
+
+    if config_path:
+        print(f"config={config_path}")
+
+    return config
+
+
+def load_config(config_path, merge_defaults: bool = True) -> Config:
+    """Load configuration with optional two-layer defaults merging.
+
+    Two-layer merge (explicit > implicit):
+    1. Load global defaults from configs/defaults.yaml (if exists)
+    2. Deep merge with specific config (specific values override defaults)
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    # Load specific config
+    if config_path.suffix in ['.yml', '.yaml']:
+        with open(config_path, 'r') as f:
+            raw_config = yaml.safe_load(f) or {}
+    elif config_path.suffix == '.json':
+        with open(config_path, 'r') as f:
+            raw_config = json.load(f)
+    else:
+        raise ValueError(f"Unsupported config format: {config_path.suffix}")
+
+    # Two-layer merge: defaults.yaml + specific.yaml
+    if merge_defaults:
+        defaults_path = _find_defaults_path(config_path)
+        if defaults_path:
+            with open(defaults_path, 'r') as f:
+                defaults_config = yaml.safe_load(f) or {}
+            raw_config = _deep_merge(defaults_config, raw_config)
+            print(f"config defaults={defaults_path}")
+
+    return _parse_config(raw_config, config_path)
+
+
+def validate_config(config: Config) -> None:
+    """Validate configuration values."""
+    valid_datasets = ['mnist', 'cifar', 'custom']
+    if config.data.dataset not in valid_datasets:
+        raise ValueError(f"Invalid dataset: {config.data.dataset}")
+
+    # Validate model type
+    # Note: convnext_v2_tiny requires timm library
+    valid_model_types = [
+        'adaptive_cnn',      # Original teacher (SE blocks)
+        'deit',              # Vision Transformer student
+        'resnet18_cifar',    # ResNet-18 adapted for CIFAR (classic CNN control)
+        'convnext_v2_tiny',  # ConvNeXt V2-Tiny (modern CNN bridge)
+    ]
+    if config.model.model_type not in valid_model_types:
+        raise ValueError(
+            f"Invalid model_type: {config.model.model_type}. "
+            f"Valid types: {valid_model_types}"
         )
 
-        ConfigManager.validate_config(config)
+    if config.data.batch_size <= 0:
+        raise ValueError("Batch size must be positive")
 
-        if config_path:
-            logger.info(f"Loaded configuration from {config_path}")
+    if config.model.dropout < 0 or config.model.dropout > 1:
+        raise ValueError("Dropout must be between 0 and 1")
 
-        return config
+    if config.training.num_epochs <= 0:
+        raise ValueError("Number of epochs must be positive")
 
-    @staticmethod
-    def validate_config(config: Config) -> None:
-        """Validate configuration values.
+    if config.training.learning_rate <= 0:
+        raise ValueError("Learning rate must be positive")
 
-        Args:
-            config: Config object to validate
+    valid_optimizers = ['adam', 'adamw', 'sgd', 'rmsprop']
+    if config.training.optimizer.lower() not in valid_optimizers:
+        raise ValueError(f"Invalid optimizer: {config.training.optimizer}")
 
-        Raises:
-            ValueError: If configuration is invalid
-        """
-        valid_datasets = ['mnist', 'cifar', 'custom']
-        if config.data.dataset not in valid_datasets:
-            raise ValueError(f"Invalid dataset: {config.data.dataset}")
+    valid_schedulers = ['step', 'cosine', 'plateau', 'exponential', 'cyclic']
+    if config.training.scheduler.lower() not in valid_schedulers:
+        raise ValueError(f"Invalid scheduler: {config.training.scheduler}")
 
-        # Validate model type
-        # Note: convnext_v2_tiny requires timm library
-        valid_model_types = [
-            'adaptive_cnn',      # Original teacher (SE blocks)
-            'deit',              # Vision Transformer student
-            'resnet18_cifar',    # ResNet-18 adapted for CIFAR (classic CNN control)
-            'convnext_v2_tiny',  # ConvNeXt V2-Tiny (modern CNN bridge)
-        ]
-        if config.model.model_type not in valid_model_types:
-            raise ValueError(
-                f"Invalid model_type: {config.model.model_type}. "
-                f"Valid types: {valid_model_types}"
-            )
 
-        if config.data.batch_size <= 0:
-            raise ValueError("Batch size must be positive")
+def save_config(config: Config, save_path) -> None:
+    """Save configuration to file."""
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if config.model.dropout < 0 or config.model.dropout > 1:
-            raise ValueError("Dropout must be between 0 and 1")
+    config_dict = {
+        'data': config.data.__dict__,
+        'model': config.model.__dict__,
+        'training': config.training.__dict__,
+        'experiment_name': config.experiment_name,
+        'seed': config.seed,
+        'device': config.device,
+        'output_dir': config.output_dir
+    }
 
-        if config.training.num_epochs <= 0:
-            raise ValueError("Number of epochs must be positive")
+    # Include optional vit and distillation configs
+    if config.vit is not None:
+        config_dict['vit'] = config.vit.__dict__
+    if config.distillation is not None:
+        config_dict['distillation'] = config.distillation.__dict__
+    if config.ss_distillation is not None:
+        config_dict['ss_distillation'] = config.ss_distillation.__dict__
 
-        if config.training.learning_rate <= 0:
-            raise ValueError("Learning rate must be positive")
+    if save_path.suffix in ['.yml', '.yaml']:
+        with open(save_path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False)
+    else:
+        with open(save_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
 
-        valid_optimizers = ['adam', 'adamw', 'sgd', 'rmsprop']
-        if config.training.optimizer.lower() not in valid_optimizers:
-            raise ValueError(f"Invalid optimizer: {config.training.optimizer}")
-
-        valid_schedulers = ['step', 'cosine', 'plateau', 'exponential', 'cyclic']
-        if config.training.scheduler.lower() not in valid_schedulers:
-            raise ValueError(f"Invalid scheduler: {config.training.scheduler}")
-
-    @staticmethod
-    def save_config(config: Config, save_path) -> None:
-        """Save configuration to file.
-
-        Args:
-            config: Config object to save
-            save_path: Path to save configuration
-        """
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        config_dict = {
-            'data': config.data.__dict__,
-            'model': config.model.__dict__,
-            'training': config.training.__dict__,
-            'logging': config.logging.__dict__,
-            'experiment_name': config.experiment_name,
-            'seed': config.seed,
-            'device': config.device,
-            'output_dir': config.output_dir
-        }
-
-        # Include optional vit and distillation configs
-        if config.vit is not None:
-            config_dict['vit'] = config.vit.__dict__
-        if config.distillation is not None:
-            config_dict['distillation'] = config.distillation.__dict__
-        if config.ss_distillation is not None:
-            config_dict['ss_distillation'] = config.ss_distillation.__dict__
-
-        if save_path.suffix in ['.yml', '.yaml']:
-            with open(save_path, 'w') as f:
-                yaml.dump(config_dict, f, default_flow_style=False)
-        else:
-            with open(save_path, 'w') as f:
-                json.dump(config_dict, f, indent=2)
-
-        logger.info(f"Saved configuration to {save_path}")
-
-    @staticmethod
-    def get_default_config(dataset: str) -> Config:
-        """Get default configuration for a dataset.
-
-        Args:
-            dataset: Dataset name ('mnist' or 'cifar')
-
-        Returns:
-            Default Config for the dataset
-
-        Raises:
-            ValueError: If dataset has no default config
-        """
-        if dataset == 'mnist':
-            return Config(
-                data=DataConfig(
-                    dataset='mnist',
-                    batch_size=64,
-                    augmentation={},
-                    normalization={'mean': [0.1307], 'std': [0.3081]}
-                ),
-                model=ModelConfig(
-                    in_channels=1,
-                    num_classes=10,
-                    dropout=0.5
-                ),
-                training=TrainingConfig(
-                    num_epochs=10,
-                    learning_rate=0.001,
-                    weight_decay=0.0005,
-                    lr_scheduler_params={'step_size': 5, 'gamma': 0.1}
-                ),
-                logging=LoggingConfig()
-            )
-        elif dataset == 'cifar':
-            return Config(
-                data=DataConfig(
-                    dataset='cifar',
-                    batch_size=128,
-                    augmentation={
-                        'random_crop': True,
-                        'random_flip': True,
-                        'color_jitter': True,
-                        'cutout': True
-                    },
-                    normalization={
-                        'mean': [0.4914, 0.4822, 0.4465],
-                        'std': [0.2470, 0.2435, 0.2616]
-                    }
-                ),
-                model=ModelConfig(
-                    in_channels=3,
-                    num_classes=10,
-                    dropout=0.5
-                ),
-                training=TrainingConfig(
-                    num_epochs=200,
-                    learning_rate=0.1,
-                    weight_decay=0.0005,
-                    optimizer='sgd',
-                    scheduler='cosine',
-                    warmup_epochs=10,
-                    lr_scheduler_params={'T_max': 200, 'eta_min': 0.0001}
-                ),
-                logging=LoggingConfig()
-            )
-        else:
-            raise ValueError(f"No default config for dataset: {dataset}")
+    print(f"config saved={save_path}")

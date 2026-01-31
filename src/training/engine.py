@@ -1,79 +1,68 @@
 """
-Training engines for standard and distributed training.
+Training engines for H100 GPUs.
 
-Provides:
-- Trainer: Single-GPU training loop
-- DDPTrainer: Multi-GPU DDP training loop
+Uses BF16 mixed precision, fused optimizers, and TF32 by default.
 """
 
 import time
-import logging
 from pathlib import Path
 from collections import defaultdict
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
+import torch.distributed as dist
+from torch.amp import autocast
 from torch.optim.swa_utils import AveragedModel, SWALR
 from tqdm import tqdm
 
-from src.config import Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig
+from src.core import Config
 
 from .components import EarlyStopping, LabelSmoothingCrossEntropy
-from .optimizers import build_optimizer, build_scheduler, HAS_PYTORCH_2, HAS_PYTORCH_2_1
-from .checkpointing import build_checkpoint_dict, restore_rng_state
-
-logger = logging.getLogger(__name__)
+from .optimizers import build_optimizer, build_scheduler
+from .checkpointing import build_checkpoint_dict
 
 
-class Trainer:
-    """Single-GPU trainer with H100 optimizations."""
+class DDPTrainer:
+    """
+    DDP trainer optimized for H100 GPUs.
 
-    def __init__(self, model, config, device):
-        self.model = model
+    Uses BF16 mixed precision (no GradScaler needed).
+    """
+
+    def __init__(self, model: nn.Module, config: Config, device: torch.device, rank: int, world_size: int):
+        # Get base model (handle DDP wrapping)
+        base_model = model.module if hasattr(model, 'module') else model
+
+        self.model = base_model
+        self.ddp_model = model
         self.config = config
         self.device = device
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main_process = (rank == 0)
 
-        # Enable TF32 for H100 (and other Ampere+ GPUs)
-        # This provides ~3x speedup on matrix multiplications
-        if config.training.use_tf32 and device.type == 'cuda':
-            torch.set_float32_matmul_precision('high')  # 'high' for speed, 'highest' for precision
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            logger.info("TF32 enabled: matmul precision='high', cuDNN TF32=True")
-
+        # Loss function
         if config.training.label_smoothing > 0:
             self.criterion = LabelSmoothingCrossEntropy(config.training.label_smoothing)
         else:
             self.criterion = nn.CrossEntropyLoss()
 
-        # Use module-level utilities for optimizer and scheduler
-        self.optimizer = build_optimizer(model, config, device)
+        # Optimizer and scheduler (fused by default)
+        self.optimizer = build_optimizer(base_model, config, device)
         self.scheduler = build_scheduler(self.optimizer, config)
 
-        self.use_amp = config.training.use_amp and device.type == 'cuda'
-        self.autocast_kwargs = {}
-        self.scaler = None
-        if self.use_amp:
-            # Use BF16 for better numerical stability on H100
-            if config.training.use_bf16:
-                self.autocast_kwargs = {'device_type': 'cuda', 'dtype': torch.bfloat16}
-                logger.info("Using BF16 mixed precision (H100 optimized) - GradScaler disabled")
-            else:
-                self.scaler = GradScaler()
-                self.autocast_kwargs = {'device_type': 'cuda'}
-                logger.info("Using FP16 mixed precision with GradScaler")
+        # BF16 autocast (H100 native, no scaler needed)
+        self.autocast_dtype = torch.bfloat16
 
+        # SWA
         self.use_swa = config.training.use_swa
         if self.use_swa:
-            self.swa_model = AveragedModel(self.model)
-            self.swa_scheduler = SWALR(
-                self.optimizer,
-                swa_lr=config.training.swa_lr
-            )
+            self.swa_model = AveragedModel(base_model)
+            self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.training.swa_lr)
             self.swa_start_epoch = int(config.training.swa_start_epoch * config.training.num_epochs)
 
+        # Early stopping
         if config.training.early_stopping:
             self.early_stopping = EarlyStopping(
                 patience=config.training.early_stopping_patience,
@@ -82,47 +71,29 @@ class Trainer:
         else:
             self.early_stopping = None
 
+        # Training state
         self.current_epoch = 0
         self.global_step = 0
-        self.best_val_loss = float('inf')
         self.best_val_acc = 0.0
-
         self.grad_accum_steps = config.training.gradient_accumulation_steps
-
         self.metrics_history = defaultdict(list)
 
-        # torch.compile support
-        self.use_compile = config.training.use_compile
-        self.compile_mode = config.training.compile_mode
+        # Pre-allocated tensors for metric reduction
+        self._loss_tensor = torch.zeros(1, device=device)
+        self._correct_tensor = torch.zeros(1, device=device, dtype=torch.long)
+        self._total_tensor = torch.zeros(1, device=device, dtype=torch.long)
 
-    def compile_model(self):
-        """Apply torch.compile optimization to the model."""
-        if self.use_compile:
-            if not HAS_PYTORCH_2:
-                logger.warning("torch.compile requires PyTorch 2.0+. Skipping compilation.")
-                return False
-            if self.compile_mode == 'max-autotune' and not HAS_PYTORCH_2_1:
-                logger.warning("compile_mode='max-autotune' requires PyTorch 2.1+. Using 'default' mode.")
-                self.compile_mode = 'default'
-            logger.info(f"Compiling model with mode='{self.compile_mode}' (H100 optimized)")
-            self.model = torch.compile(self.model, mode=self.compile_mode)
-            return True
-        return False
-
-    def save_checkpoint(self, filename, epoch, metrics):
-        """Save checkpoint using shared utility."""
+    def save_checkpoint(self, filename: str, epoch: int, metrics: dict) -> None:
+        """Save checkpoint."""
         checkpoint_dir = Path(self.config.output_dir) / 'checkpoints'
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        swa_model = self.swa_model if self.use_swa else None
-        scaler = self.scaler if self.use_amp else None
 
         checkpoint = build_checkpoint_dict(
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
-            scaler=scaler,
-            swa_model=swa_model,
+            scaler=None,
+            swa_model=self.swa_model if self.use_swa else None,
             epoch=epoch,
             metrics=metrics,
             config=self.config,
@@ -130,30 +101,18 @@ class Trainer:
             metrics_history=self.metrics_history
         )
 
-        save_path = checkpoint_dir / filename
-        torch.save(checkpoint, save_path)
-        logger.info(f"Checkpoint saved to {save_path}")
+        torch.save(checkpoint, checkpoint_dir / filename)
+        if self.is_main_process:
+            print(f"checkpoint={filename}")
 
-    def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint and restore training state."""
-        if hasattr(torch.serialization, 'add_safe_globals'):
-            torch.serialization.add_safe_globals([
-                Config,
-                DataConfig,
-                ModelConfig,
-                TrainingConfig,
-                LoggingConfig
-            ])
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
+    def load_checkpoint(self, checkpoint_path: str) -> None:
+        """Load checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        if self.use_amp and self.scaler is not None and 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         if self.use_swa and 'swa_model_state_dict' in checkpoint:
             self.swa_model.load_state_dict(checkpoint['swa_model_state_dict'])
@@ -162,223 +121,124 @@ class Trainer:
         self.best_val_acc = checkpoint.get('best_val_acc', 0)
         self.metrics_history = defaultdict(list, checkpoint.get('metrics_history', {}))
 
-        logger.info(f"Checkpoint loaded from {checkpoint_path}")
-
-
-class DDPTrainer(Trainer):
-    """Multi-GPU DDP trainer with H100 optimizations."""
-
-    def __init__(self, model, config, device, rank, world_size):
-        super().__init__(model.module if hasattr(model, 'module') else model, config, device)
-
-        # Store DDP-wrapped model for training
-        self.ddp_model = model
-        self.rank = rank
-        self.world_size = world_size
-        self.is_main_process = (rank == 0)
-
-        import torch.distributed as dist
-        self.dist = dist
-
-    def compile_model(self):
-        """Apply torch.compile optimization to the DDP model."""
-        if self.use_compile:
-            if not HAS_PYTORCH_2:
-                if self.is_main_process:
-                    logger.warning("torch.compile requires PyTorch 2.0+. Skipping compilation.")
-                return False
-            if self.compile_mode == 'max-autotune' and not HAS_PYTORCH_2_1:
-                if self.is_main_process:
-                    logger.warning("compile_mode='max-autotune' requires PyTorch 2.1+. Using 'default' mode.")
-                self.compile_mode = 'default'
-            if self.is_main_process:
-                logger.info(f"Compiling DDP model with mode='{self.compile_mode}' (H100 optimized)")
-            self.ddp_model = torch.compile(self.ddp_model, mode=self.compile_mode)
-            return True
-        return False
-
-    def train_epoch_ddp(self, train_loader, train_sampler):
-        """Train one epoch with DDP."""
+    def train_epoch_ddp(self, train_loader, train_sampler) -> dict:
+        """Train one epoch."""
         train_sampler.set_epoch(self.current_epoch)
-
         self.ddp_model.train()
-        total_loss = 0
+
+        total_loss = 0.0
         correct = 0
         total = 0
         batch_count = 0
 
-        if self.is_main_process:
-            pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}")
-        else:
-            pbar = train_loader
+        pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}") if self.is_main_process else train_loader
 
         for batch_idx, (inputs, targets) in enumerate(pbar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
 
-            if self.use_amp:
-                with autocast(**self.autocast_kwargs):
-                    outputs = self.ddp_model(inputs)
-                    loss = self.criterion(outputs, targets)
-                    loss = loss / self.grad_accum_steps
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    continue
-
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-
-                    if (batch_idx + 1) % self.grad_accum_steps == 0:
-                        if self.config.training.gradient_clip_val > 0:
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                self.ddp_model.parameters(),
-                                self.config.training.gradient_clip_val
-                            )
-
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.optimizer.zero_grad(set_to_none=True)
-                else:
-                    loss.backward()
-
-                    if (batch_idx + 1) % self.grad_accum_steps == 0:
-                        if self.config.training.gradient_clip_val > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.ddp_model.parameters(),
-                                self.config.training.gradient_clip_val
-                            )
-
-                        self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True)
-            else:
+            with autocast(device_type='cuda', dtype=self.autocast_dtype):
                 outputs = self.ddp_model(inputs)
-                loss = self.criterion(outputs, targets)
-                loss = loss / self.grad_accum_steps
+                loss = self.criterion(outputs, targets) / self.grad_accum_steps
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    continue
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
 
-                loss.backward()
+            loss.backward()
 
-                if (batch_idx + 1) % self.grad_accum_steps == 0:
-                    if self.config.training.gradient_clip_val > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.ddp_model.parameters(),
-                            self.config.training.gradient_clip_val
-                        )
-
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+            if (batch_idx + 1) % self.grad_accum_steps == 0:
+                if self.config.training.gradient_clip_val > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.ddp_model.parameters(),
+                        self.config.training.gradient_clip_val
+                    )
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * self.grad_accum_steps
             _, predicted = outputs.max(1)
-
             if len(targets.shape) > 1:
                 targets = targets.argmax(1)
-
             correct += predicted.eq(targets).sum().item()
             total += targets.size(0)
             batch_count += 1
 
             if self.is_main_process and hasattr(pbar, 'set_postfix'):
-                pbar.set_postfix({
-                    'Loss': f'{total_loss/batch_count:.4f}',
-                    'Acc': f'{100.*correct/total:.2f}%'
-                })
+                pbar.set_postfix({'Loss': f'{total_loss/batch_count:.4f}', 'Acc': f'{100.*correct/total:.2f}%'})
 
             self.global_step += 1
 
-        # Aggregate metrics across all GPUs
-        loss_tensor = torch.tensor([total_loss], device=self.device)
-        correct_tensor = torch.tensor([correct], device=self.device)
-        total_tensor = torch.tensor([total], device=self.device)
+        # All-reduce metrics
+        self._loss_tensor.fill_(total_loss)
+        self._correct_tensor.fill_(correct)
+        self._total_tensor.fill_(total)
 
-        self.dist.all_reduce(loss_tensor, op=self.dist.ReduceOp.SUM)
-        self.dist.all_reduce(correct_tensor, op=self.dist.ReduceOp.SUM)
-        self.dist.all_reduce(total_tensor, op=self.dist.ReduceOp.SUM)
+        dist.all_reduce(self._loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(self._correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(self._total_tensor, op=dist.ReduceOp.SUM)
 
-        avg_loss = loss_tensor.item() / (batch_count * self.world_size)
-        avg_acc = 100. * correct_tensor.item() / total_tensor.item()
-
-        metrics = {
-            'train_loss': avg_loss,
-            'train_acc': avg_acc
+        return {
+            'train_loss': self._loss_tensor.item() / (batch_count * self.world_size),
+            'train_acc': 100.0 * self._correct_tensor.item() / self._total_tensor.item()
         }
 
-        return metrics
-
     @torch.no_grad()
-    def validate_ddp(self, val_loader):
-        """Validate with DDP."""
+    def validate_ddp(self, val_loader) -> dict:
+        """Validate."""
         self.ddp_model.eval()
-        total_loss = 0
+        total_loss = 0.0
         correct = 0
         total = 0
 
         for inputs, targets in val_loader:
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
 
             outputs = self.ddp_model(inputs)
             loss = self.criterion(outputs, targets)
 
             total_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
-
             if len(targets.shape) > 1:
                 targets = targets.argmax(1)
-
             correct += predicted.eq(targets).sum().item()
             total += targets.size(0)
 
-        # Aggregate metrics across all GPUs
-        loss_tensor = torch.tensor([total_loss], device=self.device)
-        correct_tensor = torch.tensor([correct], device=self.device)
-        total_tensor = torch.tensor([total], device=self.device)
+        self._loss_tensor.fill_(total_loss)
+        self._correct_tensor.fill_(correct)
+        self._total_tensor.fill_(total)
 
-        self.dist.all_reduce(loss_tensor, op=self.dist.ReduceOp.SUM)
-        self.dist.all_reduce(correct_tensor, op=self.dist.ReduceOp.SUM)
-        self.dist.all_reduce(total_tensor, op=self.dist.ReduceOp.SUM)
+        dist.all_reduce(self._loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(self._correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(self._total_tensor, op=dist.ReduceOp.SUM)
 
-        avg_loss = loss_tensor.item() / total_tensor.item()
-        avg_acc = 100. * correct_tensor.item() / total_tensor.item()
-
-        metrics = {
-            'val_loss': avg_loss,
-            'val_acc': avg_acc
+        return {
+            'val_loss': self._loss_tensor.item() / self._total_tensor.item(),
+            'val_acc': 100.0 * self._correct_tensor.item() / self._total_tensor.item()
         }
 
-        return metrics
-
-    def train_ddp(self, train_loader, train_sampler, val_loader, num_epochs=None):
-        """Full DDP training loop."""
+    def train_ddp(self, train_loader, train_sampler, val_loader, num_epochs: int = None) -> dict:
+        """Full training loop."""
         num_epochs = num_epochs or self.config.training.num_epochs
 
         if self.is_main_process:
-            logger.info(f"Starting DDP training for {num_epochs} epochs")
-            logger.info(f"World Size: {self.world_size}")
-            logger.info(f"Effective Batch Size: {self.config.data.batch_size * self.world_size}")
+            print(f"start=train epochs={num_epochs} gpus={self.world_size} batch_size={self.config.data.batch_size * self.world_size}")
 
         for epoch in range(self.current_epoch, num_epochs):
             self.current_epoch = epoch
-            epoch_start_time = time.time()
+            epoch_start = time.time()
 
-            # Warmup phase
+            # Warmup
             if epoch < self.config.training.warmup_epochs:
                 warmup_lr = self.config.training.learning_rate * (epoch + 1) / self.config.training.warmup_epochs
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = warmup_lr
 
-            # Training
             train_metrics = self.train_epoch_ddp(train_loader, train_sampler)
-
-            # Validation
             val_metrics = self.validate_ddp(val_loader)
 
-            # Update scheduler
+            # Scheduler
             if self.use_swa and epoch >= self.swa_start_epoch:
                 self.swa_model.update_parameters(self.ddp_model.module)
                 self.swa_scheduler.step()
@@ -388,51 +248,32 @@ class DDPTrainer(Trainer):
                 else:
                     self.scheduler.step()
 
-            epoch_time = time.time() - epoch_start_time
-            current_lr = self.optimizer.param_groups[0]['lr']
-
-            # Only rank 0 logs and saves
             if self.is_main_process:
-                logger.info(
-                    f"Epoch [{epoch + 1}/{num_epochs}] "
-                    f"Train Loss: {train_metrics['train_loss']:.4f}, "
-                    f"Train Acc: {train_metrics['train_acc']:.2f}%, "
-                    f"Val Loss: {val_metrics['val_loss']:.4f}, "
-                    f"Val Acc: {val_metrics['val_acc']:.2f}%, "
-                    f"LR: {current_lr:.6f}, "
-                    f"Time: {epoch_time:.2f}s"
-                )
+                print(f"epoch={epoch + 1}/{num_epochs} train_loss={train_metrics['train_loss']:.4f} "
+                      f"train_acc={train_metrics['train_acc']:.2f} val_loss={val_metrics['val_loss']:.4f} "
+                      f"val_acc={val_metrics['val_acc']:.2f} lr={self.optimizer.param_groups[0]['lr']:.6f} "
+                      f"time={time.time() - epoch_start:.1f}s")
 
                 for key, value in {**train_metrics, **val_metrics}.items():
                     self.metrics_history[key].append(value)
 
-                # Save checkpoint if best
                 if val_metrics['val_acc'] > self.best_val_acc:
                     self.best_val_acc = val_metrics['val_acc']
                     self.save_checkpoint('best_model.pth', epoch, val_metrics)
 
-                # Periodic checkpoint
-                if (epoch + 1) % self.config.logging.save_frequency == 0:
+                if (epoch + 1) % 10 == 0:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pth', epoch, val_metrics)
 
-                # Early stopping
-                if self.early_stopping:
-                    if self.early_stopping(val_metrics['val_loss']):
-                        logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                        break
+                if self.early_stopping and self.early_stopping(val_metrics['val_loss']):
+                    print(f"early_stop epoch={epoch + 1}")
+                    break
 
-            # Synchronize all processes after each epoch
-            self.dist.barrier()
+            dist.barrier()
 
-        # SWA finalization
         if self.use_swa and self.is_main_process:
-            logger.info("Updating batch normalization statistics for SWA model")
             torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
-
-        if self.is_main_process:
-            logger.info("DDP training completed")
 
         return dict(self.metrics_history)
 
 
-__all__ = ['Trainer', 'DDPTrainer']
+__all__ = ['DDPTrainer']

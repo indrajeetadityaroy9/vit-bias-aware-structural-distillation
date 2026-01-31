@@ -119,10 +119,3 @@ ss_distillation:
 
   # Projector warmup (optional)
   projector_warmup_epochs: 0
-
-logging:
-  log_dir: ./logs/deit_dinov2_cka
-  log_level: INFO
-  save_frequency: 10
-  track_grad_norm: true
-  wandb: false

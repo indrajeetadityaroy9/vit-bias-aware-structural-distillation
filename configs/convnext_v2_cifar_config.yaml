@@ -62,10 +62,3 @@ training:
   compile_mode: max-autotune
   use_fused_optimizer: true
   use_tf32: true
-
-logging:
-  log_dir: ./logs/convnext_v2_cifar
-  log_level: INFO
-  save_frequency: 10
-  track_grad_norm: true
-  wandb: false

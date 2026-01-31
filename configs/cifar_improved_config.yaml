@@ -25,14 +25,6 @@ data:
   prefetch_factor: 2
 device: cuda
 experiment_name: cifar_improved
-logging:
-  log_dir: ./logs
-  log_level: INFO
-  save_frequency: 10
-  track_grad_norm: true
-  wandb: false
-  wandb_entity: null
-  wandb_project: adaptive-cnn
 model:
   architecture: []
   classifier_layers: []

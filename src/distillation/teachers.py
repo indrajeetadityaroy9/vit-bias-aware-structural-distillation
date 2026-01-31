@@ -7,9 +7,6 @@ Provides:
 """
 
 import torch
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 # Embedding dimension lookup for DINO/DINOv2 models
@@ -41,10 +38,8 @@ def load_dino_teacher(teacher_type, model_name, device):
         embed_dim: Teacher embedding dimension
     """
     if teacher_type == 'dinov2':
-        logger.info(f"Loading DINOv2 teacher: {model_name}")
         teacher_model = torch.hub.load('facebookresearch/dinov2', model_name)
     elif teacher_type == 'dino':
-        logger.info(f"Loading DINO teacher: {model_name}")
         teacher_model = torch.hub.load('facebookresearch/dino:main', model_name)
     else:
         raise ValueError(f"Unknown teacher_type: {teacher_type}. Use 'dino' or 'dinov2'.")
@@ -57,8 +52,8 @@ def load_dino_teacher(teacher_type, model_name, device):
     for param in teacher_model.parameters():
         param.requires_grad = False
 
-    logger.info(f"Loaded {teacher_type} teacher: {model_name} (embed_dim={embed_dim}, frozen)")
+    print(f"teacher={model_name} dim={embed_dim}")
     return teacher_model, embed_dim
 
 
-__all__ = ['load_dino_teacher', 'DINO_EMBED_DIMS']
+__all__ = ['load_dino_teacher']

@@ -125,42 +125,5 @@ class TestModelRegistry:
         assert 'convnext_v2_tiny' in models
 
 
-class TestDatasetRegistry:
-    """Tests for dataset registration."""
-
-    def test_list_datasets(self):
-        """Verify all expected datasets are registered."""
-        from src.data import list_datasets
-
-        datasets = list_datasets()
-
-        assert 'cifar' in datasets
-        assert 'mnist' in datasets
-        assert 'fashion_mnist' in datasets
-
-    def test_create_cifar_dataset(self):
-        """Verify CIFAR dataset can be created."""
-        from src.data import create_dataset
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dataset = create_dataset(
-                name='cifar',
-                root=tmpdir,
-                train=True,
-                transform=None
-            )
-
-            # CIFAR-10 has 50000 training samples
-            assert len(dataset) == 50000
-
-    def test_unknown_dataset_raises_error(self):
-        """Verify unknown dataset name raises ValueError."""
-        from src.data import create_dataset
-
-        with pytest.raises(ValueError, match="Unknown dataset"):
-            create_dataset('nonexistent_dataset', root='./data')
-
-
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

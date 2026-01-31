@@ -1,6 +1,3 @@
-# =============================================================================
-# Python
-# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -22,10 +19,6 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# =============================================================================
-# Virtual Environments (exclude all variations)
-# =============================================================================
 venv/
 .venv/
 env/
@@ -35,10 +28,6 @@ env.bak/
 venv.bak/
 .python-version
 Pipfile.lock
-
-# =============================================================================
-# IDE and Editor
-# =============================================================================
 .vscode/
 .idea/
 *.swp
@@ -49,10 +38,6 @@ Pipfile.lock
 *.sublime-workspace
 .spyderproject
 .spyproject
-
-# =============================================================================
-# Data Files and Directories
-# =============================================================================
 data/
 datasets/
 *.csv
@@ -64,16 +49,13 @@ datasets/
 *.pkl
 *.pickle
 
-# MNIST/CIFAR downloaded data
+
 MNIST/
 CIFAR/
 CIFAR10/
 cifar-10-batches-py/
 cifar-10-python.tar.gz
 
-# =============================================================================
-# Model Checkpoints and Outputs
-# =============================================================================
 outputs/
 checkpoints/
 results/
@@ -85,16 +67,6 @@ runs/
 *.safetensors
 *.bin
 
-# TensorBoard
-tensorboard/
-events.out.tfevents.*
-
-# Weights & Biases
-wandb/
-
-# =============================================================================
-# Testing and Coverage
-# =============================================================================
 .pytest_cache/
 .coverage
 .coverage.*
@@ -106,21 +78,9 @@ coverage.xml
 *.py,cover
 .hypothesis/
 
-# =============================================================================
-# Documentation builds
-# =============================================================================
 docs/_build/
 site/
 
-# =============================================================================
-# Jupyter Notebooks
-# =============================================================================
-.ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# =============================================================================
-# Miscellaneous
-# =============================================================================
 *.log
 *.tmp
 *.temp
@@ -129,7 +89,6 @@ site/
 .cache/
 verification_results/
 
-# Large files
 *.zip
 *.tar
 *.tar.gz
@@ -137,7 +96,6 @@ verification_results/
 *.rar
 *.7z
 
-# Images generated during training/evaluation
 *.png
 *.jpg
 *.jpeg

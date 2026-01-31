@@ -36,15 +36,6 @@ experiment_name: deit_cifar_improved
 output_dir: ./outputs
 seed: 42
 
-logging:
-  log_dir: ./logs
-  log_level: INFO
-  save_frequency: 10
-  track_grad_norm: true
-  wandb: false
-  wandb_entity: null
-  wandb_project: adaptive-cnn
-
 model:
   model_type: deit
   in_channels: 3

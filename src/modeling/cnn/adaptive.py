@@ -4,11 +4,8 @@ AdaptiveCNN model with registry decorator.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
 
 from src.modeling.registry import register_model
-
-logger = logging.getLogger(__name__)
 
 
 class SEBlock(nn.Module):
@@ -87,8 +84,6 @@ class AdaptiveCNN(nn.Module):
 
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(config.get('dropout', 0.5))
-
-        logger.info(f"Initialized AdaptiveCNN for {self.dataset} dataset")
 
     def _build_mnist_architecture(self):
         """Build deeper MNIST architecture for 99%+ accuracy."""
@@ -198,5 +193,4 @@ class AdaptiveCNN(nn.Module):
         return x
 
 
-# Export for backward compatibility
 __all__ = ['AdaptiveCNN', 'SEBlock', 'ResidualBlock']

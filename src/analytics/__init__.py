@@ -1,33 +1,15 @@
 """
-Research analytics module for the Locality Curse study.
+Analytics module for model analysis.
 
-Provides:
-- Metrics: Hessian trace, attention distance, CKA
-- Visualization: Publication-quality plots
-- LocalityCurseForensics: Complete diagnostic toolkit
+Provides Hessian trace, attention distance, and CKA metrics.
 """
 
-from .metrics import (
-    HessianAnalyzer,
-    AttentionDistanceAnalyzer,
-    CKAAnalyzer,
-)
-
-from .visualization import AnalyticsVisualizer
-
-from .engine import (
-    AnalyticsRunner,
-    LocalityCurseForensics,
-)
+from .metrics import HessianAnalyzer, AttentionDistanceAnalyzer, CKAAnalyzer
+from .engine import run_analytics
 
 __all__ = [
-    # Metrics
     'HessianAnalyzer',
     'AttentionDistanceAnalyzer',
     'CKAAnalyzer',
-    # Runners
-    'AnalyticsRunner',
-    'LocalityCurseForensics',
-    # Visualization
-    'AnalyticsVisualizer',
+    'run_analytics',
 ]

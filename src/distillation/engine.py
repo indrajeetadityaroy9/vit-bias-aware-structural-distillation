@@ -8,7 +8,6 @@ Provides:
 
 import math
 import time
-import logging
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -22,8 +21,6 @@ from tqdm import tqdm
 from src.training import DDPTrainer, build_checkpoint_dict
 
 from .losses import DistillationLoss, SelfSupervisedDistillationLoss
-
-logger = logging.getLogger(__name__)
 
 
 class DistillationTrainer(DDPTrainer):
@@ -80,14 +77,8 @@ class DistillationTrainer(DDPTrainer):
         self.distillation_metrics = defaultdict(list)
 
         if self.is_main_process:
-            logger.info(f"Distillation Trainer initialized:")
-            logger.info(f"  - Type: {self.distillation_type}")
-            logger.info(f"  - Alpha: {self.distillation_alpha}")
-            logger.info(f"  - Alpha schedule: {self.alpha_schedule}")
-            if self.alpha_schedule != 'constant':
-                logger.info(f"  - Alpha range: {self.alpha_start} -> {self.alpha_end}")
-            logger.info(f"  - Tau: {self.distillation_tau}")
-            logger.info(f"  - Warmup epochs: {self.distillation_warmup_epochs}")
+            alpha_str = f" alpha_range={self.alpha_start}->{self.alpha_end}" if self.alpha_schedule != 'constant' else ""
+            print(f"distill type={self.distillation_type} alpha={self.distillation_alpha} schedule={self.alpha_schedule}{alpha_str} tau={self.distillation_tau} warmup={self.distillation_warmup_epochs}")
 
     def get_scheduled_alpha(self, epoch):
         """
@@ -186,9 +177,7 @@ class DistillationTrainer(DDPTrainer):
 
                     loss = loss / self.grad_accum_steps
 
-                # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
 
@@ -403,10 +392,7 @@ class DistillationTrainer(DDPTrainer):
         num_epochs = num_epochs or self.config.training.num_epochs
 
         if self.is_main_process:
-            logger.info(f"Starting DeiT distillation training for {num_epochs} epochs")
-            logger.info(f"World Size: {self.world_size}")
-            logger.info(f"Effective Batch Size: {self.config.data.batch_size * self.world_size}")
-            logger.info(f"Distillation warmup: {self.distillation_warmup_epochs} epochs")
+            print(f"start=distill epochs={num_epochs} gpus={self.world_size} batch_size={self.config.data.batch_size * self.world_size} warmup={self.distillation_warmup_epochs}")
 
         for epoch in range(self.current_epoch, num_epochs):
             self.current_epoch = epoch
@@ -438,21 +424,12 @@ class DistillationTrainer(DDPTrainer):
             epoch_time = time.time() - epoch_start_time
             current_lr = self.optimizer.param_groups[0]['lr']
 
-            # Only rank 0 logs and saves
             if self.is_main_process:
-                in_warmup = epoch < self.distillation_warmup_epochs
-                warmup_indicator = " [Warmup]" if in_warmup else ""
-
-                logger.info(
-                    f"Epoch [{epoch + 1}/{num_epochs}]{warmup_indicator} "
-                    f"Loss: {train_metrics['train_loss']:.4f}, "
-                    f"Train Acc: {train_metrics['train_acc']:.2f}%, "
-                    f"Val Acc: {val_metrics['val_acc']:.2f}% "
-                    f"(cls: {val_metrics['val_cls_acc']:.2f}%, dist: {val_metrics['val_dist_acc']:.2f}%), "
-                    f"Agreement: {train_metrics['train_agreement']:.1f}%, "
-                    f"LR: {current_lr:.6f}, "
-                    f"Time: {epoch_time:.2f}s"
-                )
+                warmup_str = " warmup" if epoch < self.distillation_warmup_epochs else ""
+                print(f"epoch={epoch + 1}/{num_epochs}{warmup_str} loss={train_metrics['train_loss']:.4f} "
+                      f"train_acc={train_metrics['train_acc']:.2f} val_acc={val_metrics['val_acc']:.2f} "
+                      f"cls_acc={val_metrics['val_cls_acc']:.2f} dist_acc={val_metrics['val_dist_acc']:.2f} "
+                      f"agreement={train_metrics['train_agreement']:.1f} lr={current_lr:.6f} time={epoch_time:.1f}s")
 
                 # Save metrics history
                 for key, value in {**train_metrics, **val_metrics}.items():
@@ -464,25 +441,21 @@ class DistillationTrainer(DDPTrainer):
                     self.save_checkpoint('best_model.pth', epoch, val_metrics)
 
                 # Periodic checkpoint
-                if (epoch + 1) % self.config.logging.save_frequency == 0:
+                if (epoch + 1) % 10 == 0:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pth', epoch, val_metrics)
 
-                # Early stopping
                 if self.early_stopping:
                     if self.early_stopping(val_metrics['val_loss']):
-                        logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                        print(f"early_stop epoch={epoch + 1}")
                         break
 
-            # Synchronize all processes after each epoch
             self.dist.barrier()
 
-        # SWA finalization
         if self.use_swa and self.is_main_process:
-            logger.info("Updating batch normalization statistics for SWA model")
             torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
 
         if self.is_main_process:
-            logger.info(f"Distillation training completed. Best Val Acc: {self.best_val_acc:.2f}%")
+            print(f"done best_val_acc={self.best_val_acc:.2f}")
 
         return dict(self.metrics_history)
 
@@ -523,7 +496,7 @@ class DistillationTrainer(DDPTrainer):
 
         save_path = checkpoint_dir / filename
         torch.save(checkpoint, save_path)
-        logger.info(f"Checkpoint saved to {save_path}")
+        print(f"checkpoint={save_path}")
 
 
 class SelfSupervisedDistillationTrainer(DDPTrainer):
@@ -600,28 +573,15 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
         if aug_config.get('mixup') or aug_config.get('cutmix'):
             self.mixup_alpha = aug_config.get('mixup_alpha', 1.0) if aug_config.get('mixup') else 0.0
             self.cutmix_alpha = aug_config.get('cutmix_alpha', 1.0) if aug_config.get('cutmix') else 0.0
-            if self.is_main_process:
-                logger.info(f"  - MixUp/CutMix enabled (mixup_alpha={self.mixup_alpha}, cutmix_alpha={self.cutmix_alpha})")
 
         if self.is_main_process:
-            logger.info("=" * 60)
-            logger.info("Self-Supervised Distillation Trainer initialized:")
-            logger.info(f"  - Teacher: {self.ss_config.teacher_model_name} (dim={self.teacher_embed_dim})")
-            logger.info(f"  - Student: DeiT (dim={self.student_embed_dim})")
-            logger.info(f"  - Token layers: {self.token_layers}")
-            logger.info(f"  - Lambda_tok: {self.ss_config.lambda_tok}")
-            logger.info(f"  - Lambda_rel: {self.ss_config.lambda_rel}")
-            logger.info(f"  - Rel warmup epochs: {self.ss_config.rel_warmup_epochs}")
-            logger.info(f"  - Dual-augment: {self.use_dual_augment}")
-            if self.use_cka:
-                logger.info(f"  - CKA Loss: ENABLED (lambda={getattr(self.ss_config, 'lambda_cka', 0.5)}, "
-                           f"kernel={getattr(self.ss_config, 'cka_kernel_type', 'linear')})")
-            if self.use_gram:
-                logger.info(f"  - Gram Loss: ENABLED (lambda={getattr(self.ss_config, 'lambda_gram', 0.5)})")
-            logger.info(f"  - Student tokens: {self.student_num_tokens}")
-            if self.use_cls_only:
-                logger.info(f"  - CLS-only mode: ENABLED (global semantic alignment)")
-            logger.info("=" * 60)
+            cka_str = f" cka=lambda={getattr(self.ss_config, 'lambda_cka', 0.5)}" if self.use_cka else ""
+            gram_str = f" gram=lambda={getattr(self.ss_config, 'lambda_gram', 0.5)}" if self.use_gram else ""
+            cls_str = " cls_only" if self.use_cls_only else ""
+            print(f"ss_distill teacher={self.ss_config.teacher_model_name} teacher_dim={self.teacher_embed_dim} "
+                  f"student_dim={self.student_embed_dim} layers={self.token_layers} "
+                  f"lambda_tok={self.ss_config.lambda_tok} lambda_rel={self.ss_config.lambda_rel} "
+                  f"rel_warmup={self.ss_config.rel_warmup_epochs} dual_aug={self.use_dual_augment}{cka_str}{gram_str}{cls_str}")
 
     def apply_mixup(self, images, targets):
         """
@@ -914,9 +874,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
                     loss = loss / self.grad_accum_steps
 
-                # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
 
@@ -966,9 +924,7 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
 
                 loss = loss / self.grad_accum_steps
 
-                # Check for NaN/Inf loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN/Inf loss detected at batch {batch_idx}, skipping batch")
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
 
@@ -1062,11 +1018,8 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
         num_epochs = num_epochs or self.config.training.num_epochs
 
         if self.is_main_process:
-            logger.info(f"Starting CST-style self-supervised distillation for {num_epochs} epochs")
-            logger.info(f"World Size: {self.world_size}")
-            logger.info(f"Effective Batch Size: {self.config.data.batch_size * self.world_size}")
-            logger.info(f"Stage A (L_tok only): epochs 0-{self.ss_config.rel_warmup_epochs-1}")
-            logger.info(f"Stage B (L_tok + L_rel): epochs {self.ss_config.rel_warmup_epochs}+")
+            print(f"start=ss_distill epochs={num_epochs} gpus={self.world_size} batch_size={self.config.data.batch_size * self.world_size} "
+                  f"stage_a=0-{self.ss_config.rel_warmup_epochs-1} stage_b={self.ss_config.rel_warmup_epochs}+")
 
         for epoch in range(self.current_epoch, num_epochs):
             self.current_epoch = epoch
@@ -1098,32 +1051,16 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
             epoch_time = time.time() - epoch_start_time
             current_lr = self.optimizer.param_groups[0]['lr']
 
-            # Only rank 0 logs and saves
             if self.is_main_process:
                 stage = "A" if epoch < self.ss_config.rel_warmup_epochs else "B"
+                rel_str = f" rel={train_metrics['train_rel_loss']:.4f}" if train_metrics['train_rel_loss'] > 0 else ""
+                cka_str = f" cka={train_metrics.get('train_cka_loss', 0):.4f}" if self.use_cka and train_metrics.get('train_cka_loss', 0) > 0 else ""
+                gram_str = f" gram={train_metrics.get('train_gram_loss', 0):.4f}" if self.use_gram and train_metrics.get('train_gram_loss', 0) > 0 else ""
 
-                # Build loss breakdown string
-                loss_parts = [
-                    f"CE: {train_metrics['train_ce_loss']:.4f}",
-                    f"Tok: {train_metrics['train_tok_loss']:.4f}",
-                ]
-                if train_metrics['train_rel_loss'] > 0:
-                    loss_parts.append(f"Rel: {train_metrics['train_rel_loss']:.4f}")
-                if self.use_cka and train_metrics.get('train_cka_loss', 0) > 0:
-                    loss_parts.append(f"CKA: {train_metrics['train_cka_loss']:.4f}")
-                if self.use_gram and train_metrics.get('train_gram_loss', 0) > 0:
-                    loss_parts.append(f"Gram: {train_metrics['train_gram_loss']:.4f}")
-                loss_breakdown = ", ".join(loss_parts)
-
-                logger.info(
-                    f"Epoch [{epoch + 1}/{num_epochs}] [Stage {stage}] "
-                    f"Loss: {train_metrics['train_loss']:.4f} "
-                    f"({loss_breakdown}), "
-                    f"Train Acc: {train_metrics['train_acc']:.2f}%, "
-                    f"Val Acc: {val_metrics['val_acc']:.2f}%, "
-                    f"LR: {current_lr:.6f}, "
-                    f"Time: {epoch_time:.2f}s"
-                )
+                print(f"epoch={epoch + 1}/{num_epochs} stage={stage} loss={train_metrics['train_loss']:.4f} "
+                      f"ce={train_metrics['train_ce_loss']:.4f} tok={train_metrics['train_tok_loss']:.4f}{rel_str}{cka_str}{gram_str} "
+                      f"train_acc={train_metrics['train_acc']:.2f} val_acc={val_metrics['val_acc']:.2f} "
+                      f"lr={current_lr:.6f} time={epoch_time:.1f}s")
 
                 # Save metrics history
                 for key, value in {**train_metrics, **val_metrics}.items():
@@ -1135,25 +1072,21 @@ class SelfSupervisedDistillationTrainer(DDPTrainer):
                     self.save_checkpoint('best_model.pth', epoch, val_metrics)
 
                 # Periodic checkpoint
-                if (epoch + 1) % self.config.logging.save_frequency == 0:
+                if (epoch + 1) % 10 == 0:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pth', epoch, val_metrics)
 
-                # Early stopping
                 if self.early_stopping:
                     if self.early_stopping(val_metrics['val_loss']):
-                        logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                        print(f"early_stop epoch={epoch + 1}")
                         break
 
-            # Synchronize all processes
             self.dist.barrier()
 
-        # SWA finalization
         if self.use_swa and self.is_main_process:
-            logger.info("Updating batch normalization statistics for SWA model")
             torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
 
         if self.is_main_process:
-            logger.info(f"Self-supervised distillation completed. Best Val Acc: {self.best_val_acc:.2f}%")
+            print(f"done best_val_acc={self.best_val_acc:.2f}")
 
         return dict(self.metrics_history)
 

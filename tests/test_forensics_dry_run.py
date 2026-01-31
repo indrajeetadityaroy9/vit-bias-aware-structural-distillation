@@ -4,16 +4,11 @@ Dry run test for Locality Curse Forensics Kit.
 This test verifies the pipeline works with synthetic data before
 investing hours in training real models.
 
-Run with: python tests/test_forensics_dry_run.py
+Run with: pytest tests/test_forensics_dry_run.py
 """
 
-import sys
-import os
 import json
 import numpy as np
-
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
@@ -24,7 +19,6 @@ def test_compute_head_statistics():
     print("TEST 1: compute_head_statistics with synthetic attention")
     print("="*60)
 
-    # Import after path setup
     from src.analytics import AttentionDistanceAnalyzer
 
     # Create a dummy ViT-like model
@@ -112,89 +106,14 @@ def test_compute_head_statistics():
     return True
 
 
-def test_visualization_methods():
-    """Test visualization methods with synthetic results."""
-    print("\n" + "="*60)
-    print("TEST 2: Visualization methods")
-    print("="*60)
-
-    from src.analytics import AnalyticsVisualizer
-    import tempfile
-    import os
-
-    # Create synthetic results
-    results_dict = {
-        'Model_A': {
-            'hessian_trace': 1234.5,
-            'avg_attention_distance': 2.5,
-            'collapsed_heads_ratio': 0.3,
-            'avg_entropy': 3.2,
-            'avg_cls_dispersion': 4.1,
-            'per_layer_stats': {
-                0: {'mean_distance': np.array([1.5, 2.0, 2.5])},
-                6: {'mean_distance': np.array([2.0, 2.5, 3.0])},
-                11: {'mean_distance': np.array([2.5, 3.0, 3.5])},
-            }
-        },
-        'Model_B': {
-            'hessian_trace': 987.6,
-            'avg_attention_distance': 3.5,
-            'collapsed_heads_ratio': 0.1,
-            'avg_entropy': 3.8,
-            'avg_cls_dispersion': 5.2,
-            'per_layer_stats': {
-                0: {'mean_distance': np.array([2.5, 3.0, 3.5])},
-                6: {'mean_distance': np.array([3.0, 3.5, 4.0])},
-                11: {'mean_distance': np.array([3.5, 4.0, 4.5])},
-            }
-        }
-    }
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        print(f"Output directory: {tmpdir}")
-
-        # Test plot_locality_spectrum
-        try:
-            AnalyticsVisualizer.plot_locality_spectrum(results_dict, tmpdir)
-            if os.path.exists(os.path.join(tmpdir, 'locality_spectrum.png')):
-                print("  ✓ locality_spectrum.png created")
-            else:
-                print("  ❌ locality_spectrum.png NOT created")
-        except Exception as e:
-            print(f"  ❌ plot_locality_spectrum failed: {e}")
-
-        # Test plot_layer_progression
-        try:
-            AnalyticsVisualizer.plot_layer_progression(results_dict, tmpdir)
-            if os.path.exists(os.path.join(tmpdir, 'layer_progression.png')):
-                print("  ✓ layer_progression.png created")
-            else:
-                print("  ❌ layer_progression.png NOT created")
-        except Exception as e:
-            print(f"  ❌ plot_layer_progression failed: {e}")
-
-        # Test plot_forensics_summary
-        try:
-            AnalyticsVisualizer.plot_forensics_summary(results_dict, tmpdir)
-            if os.path.exists(os.path.join(tmpdir, 'forensics_summary.png')):
-                print("  ✓ forensics_summary.png created")
-            else:
-                print("  ❌ forensics_summary.png NOT created")
-        except Exception as e:
-            print(f"  ❌ plot_forensics_summary failed: {e}")
-
-    print("\n✓ Visualization tests complete!")
-    return True
-
-
 def test_full_forensics_pipeline():
-    """Test the full LocalityCurseForensics pipeline with a random model."""
+    """Test the full forensics pipeline with a random model."""
     print("\n" + "="*60)
     print("TEST 3: Full forensics pipeline with random DeiT")
     print("="*60)
 
-    from src.analytics import LocalityCurseForensics
-    from src.vit import DeiT
+    from src.analytics import run_locality_forensics
+    from src.modeling.vit.deit import DeiT
     import tempfile
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -229,15 +148,13 @@ def test_full_forensics_pipeline():
     with tempfile.TemporaryDirectory() as tmpdir:
         print(f"Output directory: {tmpdir}")
 
-        # Run forensics
-        forensics = LocalityCurseForensics(device=str(device))
-
         try:
-            results = forensics.run_full_forensics(
+            results = run_locality_forensics(
                 model=model,
                 dataloader=dataloader,
                 model_name="RandomDeiT",
                 output_dir=tmpdir,
+                device=str(device),
                 img_size=32,
                 patch_size=4,
                 num_samples=num_samples
@@ -317,20 +234,11 @@ def main():
         traceback.print_exc()
         results.append(("compute_head_statistics", False))
 
-    # Test 2: Visualization methods
-    try:
-        results.append(("visualization_methods", test_visualization_methods()))
-    except Exception as e:
-        print(f"Test 2 crashed: {e}")
-        import traceback
-        traceback.print_exc()
-        results.append(("visualization_methods", False))
-
-    # Test 3: Full pipeline (requires DeiT)
+    # Test 2: Full pipeline (requires DeiT)
     try:
         results.append(("full_pipeline", test_full_forensics_pipeline()))
     except Exception as e:
-        print(f"Test 3 crashed: {e}")
+        print(f"Test 2 crashed: {e}")
         import traceback
         traceback.print_exc()
         results.append(("full_pipeline", False))
