@@ -1,0 +1,5 @@
+# ConvNeXt V2-Tiny architecture reference
+model:
+  model_type: convnext_v2_tiny
+  pretrained: true
+  drop_path_rate: 0.1

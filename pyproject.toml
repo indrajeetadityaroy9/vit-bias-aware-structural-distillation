@@ -41,12 +41,15 @@ dev = [
     "mypy>=1.8.0",
     "isort>=5.13.0",
 ]
+analytics = [
+    "pyhessian",
+]
 h100 = [
     "flash-attn>=2.5.0",
 ]
 
 [project.scripts]
-vit-distill = "main:main"
+vit-distill = "src.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

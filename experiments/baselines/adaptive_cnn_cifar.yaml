@@ -1,0 +1,52 @@
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    trivial_augment: true
+    cutout: true
+    cutmix: true
+    cutmix_alpha: 1.0
+  batch_size: 2048
+  data_path: ./data
+  dataset: cifar
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+device: cuda
+experiment_name: cifar_improved
+model:
+  architecture: []
+  classifier_layers: []
+  dropout: 0.3
+  in_channels: 3
+  model_type: adaptive_cnn
+  num_classes: 10
+  use_se: true
+output_dir: ./outputs/cifar_improved
+seed: 42
+training:
+  early_stopping: true
+  early_stopping_min_delta: 0.0005
+  early_stopping_patience: 15
+  gradient_accumulation_steps: 1
+  gradient_clip_val: 1.0
+  label_smoothing: 0.1
+  learning_rate: 0.8
+  lr_scheduler_params:
+    T_max: 40
+    eta_min: 0.00001
+  num_epochs: 40
+  optimizer: sgd
+  scheduler: cosine
+  swa_lr: 0.0005
+  swa_start_epoch: 0.75
+  use_amp: true
+  use_swa: true
+  warmup_epochs: 5
+  weight_decay: 0.0005
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true

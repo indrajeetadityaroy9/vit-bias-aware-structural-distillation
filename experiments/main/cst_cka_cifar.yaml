@@ -1,0 +1,103 @@
+# DeiT with DINOv2 CKA Structural Distillation Configuration
+# EXP-3: Self-supervised structural distillation
+# Expected: >89% accuracy, flat loss landscape, long-range attention
+
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    trivial_augment: true
+    cutout: true
+    cutmix: true
+    cutmix_alpha: 1.0
+    mixup: true
+    mixup_alpha: 0.8
+  batch_size: 2048
+  data_path: ./data
+  dataset: cifar
+  num_workers: 16
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  drop_last: true
+
+device: cuda
+experiment_name: deit_dinov2_cka_distill
+output_dir: ./outputs/deit_dinov2_cka
+
+seed: 42
+
+model:
+  model_type: deit
+  in_channels: 3
+  num_classes: 10
+  dropout: 0.1
+
+# DeiT-Tiny configuration
+vit:
+  variant: tiny
+  img_size: 32
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: true
+  inference_mode: avg
+
+training:
+  num_epochs: 200
+  learning_rate: 0.001
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.001
+  label_smoothing: 0.1
+  use_swa: true
+  swa_start_epoch: 0.8
+  swa_lr: 0.0001
+  lr_scheduler_params:
+    T_max: 200
+    eta_min: 0.000001
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true
+
+# Self-supervised distillation with CKA structural loss
+ss_distillation:
+  teacher_type: dinov2
+  teacher_model_name: dinov2_vits14
+  teacher_embed_dim: 384
+
+  token_layers: [3, 6, 9, 11]
+  projection_dim: 256
+  lambda_tok: 0.5
+  token_loss_type: cosine
+
+  lambda_rel: 0.05
+  correlation_temperature: 0.1
+  correlation_loss_type: kl
+  use_pooled_correlation: true
+  rel_warmup_epochs: 10
+
+  use_cka_loss: true
+  lambda_cka: 0.5
+  cka_kernel_type: linear
+  cka_warmup_epochs: 5
+
+  use_gram_loss: false
+  lambda_gram: 0.0
+
+  use_dual_augment: true
+  projector_warmup_epochs: 0

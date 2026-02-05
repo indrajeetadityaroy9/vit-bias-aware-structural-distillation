@@ -7,11 +7,11 @@ Provides:
 
 import random
 
-import torch
 import numpy as np
+import torch
 
 
-def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
+def build_checkpoint_dict(model, optimizer, scheduler, swa_model,
                           epoch, metrics, config, best_val_acc, metrics_history,
                           extra_metadata=None):
     """
@@ -21,7 +21,6 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
         model: PyTorch model (unwrapped from DDP)
         optimizer: Optimizer
         scheduler: LR scheduler (optional)
-        scaler: GradScaler (optional)
         swa_model: SWA model (optional)
         epoch: Current epoch
         metrics: Current metrics dict
@@ -54,9 +53,6 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
-    if scaler is not None:
-        checkpoint['scaler_state_dict'] = scaler.state_dict()
-
     if swa_model is not None:
         checkpoint['swa_model_state_dict'] = swa_model.state_dict()
 
@@ -64,6 +60,3 @@ def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
         checkpoint.update(extra_metadata)
 
     return checkpoint
-
-
-__all__ = ['build_checkpoint_dict']

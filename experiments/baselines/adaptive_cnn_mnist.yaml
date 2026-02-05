@@ -1,0 +1,48 @@
+data:
+  augmentation:
+    trivial_augment: true
+    cutout: true
+  batch_size: 4096
+  data_path: ./data
+  dataset: mnist
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+device: cuda
+experiment_name: mnist_improved
+model:
+  architecture: []
+  classifier_layers: []
+  dropout: 0.3
+  in_channels: 1
+  model_type: adaptive_cnn
+  num_classes: 10
+  use_se: true
+output_dir: ./outputs/mnist_improved
+seed: 42
+training:
+  early_stopping: true
+  early_stopping_min_delta: 0.0005
+  early_stopping_patience: 20
+  gradient_accumulation_steps: 1
+  gradient_clip_val: 1.0
+  label_smoothing: 0.1
+  learning_rate: 0.08
+  lr_scheduler_params:
+    T_max: 20
+    eta_min: 0.00001
+  num_epochs: 20
+  optimizer: adamw
+  scheduler: cosine
+  swa_lr: 0.0005
+  swa_start_epoch: 0.75
+  use_amp: true
+  use_swa: true
+  warmup_epochs: 2
+  weight_decay: 0.0005
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true

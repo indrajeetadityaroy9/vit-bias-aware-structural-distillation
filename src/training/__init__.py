@@ -2,7 +2,7 @@
 Training infrastructure module.
 """
 
-from .engine import DDPTrainer
-from .checkpointing import build_checkpoint_dict
-
-__all__ = ['DDPTrainer', 'build_checkpoint_dict']
+from src.training.trainer import DDPTrainer
+from src.training.distillation import DistillationTrainer, SelfSupervisedDistillationTrainer
+from src.training.checkpointing import build_checkpoint_dict
+from src.training.optim import build_optimizer, build_scheduler

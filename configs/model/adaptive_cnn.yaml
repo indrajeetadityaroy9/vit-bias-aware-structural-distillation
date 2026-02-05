@@ -1,0 +1,5 @@
+# AdaptiveCNN architecture reference
+model:
+  model_type: adaptive_cnn
+  use_se: true
+  dropout: 0.3

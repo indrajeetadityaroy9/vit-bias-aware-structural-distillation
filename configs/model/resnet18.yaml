@@ -1,0 +1,4 @@
+# ResNet-18 for CIFAR architecture reference
+model:
+  model_type: resnet18_cifar
+  dropout: 0.0

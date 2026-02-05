@@ -18,7 +18,7 @@ class TestTokenCorrelationLoss:
 
     def test_no_nan_with_normal_inputs(self):
         """Verify TokenCorrelationLoss doesn't produce NaN with normal inputs."""
-        from src.distillation import TokenCorrelationLoss
+        from src.training.losses import TokenCorrelationLoss
 
         loss_fn = TokenCorrelationLoss(temperature=0.1, loss_type='kl')
         student = torch.randn(4, 64, 192)
@@ -32,7 +32,7 @@ class TestTokenCorrelationLoss:
 
     def test_no_nan_with_extreme_values(self):
         """Verify TokenCorrelationLoss handles extreme values."""
-        from src.distillation import TokenCorrelationLoss
+        from src.training.losses import TokenCorrelationLoss
 
         loss_fn = TokenCorrelationLoss(temperature=0.1, loss_type='kl')
 
@@ -54,7 +54,7 @@ class TestTokenCorrelationLoss:
 
     def test_pooled_mode(self):
         """Verify pooled mode works correctly."""
-        from src.distillation import TokenCorrelationLoss
+        from src.training.losses import TokenCorrelationLoss
 
         loss_fn = TokenCorrelationLoss(temperature=0.1, loss_type='kl', use_pooled=True)
         student = torch.randn(8, 64, 192)
@@ -66,7 +66,7 @@ class TestTokenCorrelationLoss:
 
     def test_frobenius_mode(self):
         """Verify Frobenius norm mode works correctly."""
-        from src.distillation import TokenCorrelationLoss
+        from src.training.losses import TokenCorrelationLoss
 
         loss_fn = TokenCorrelationLoss(temperature=0.1, loss_type='frobenius')
         student = torch.randn(4, 64, 192)
@@ -82,7 +82,7 @@ class TestCKALoss:
 
     def test_cka_loss_shapes(self):
         """Verify CKA loss handles different embedding dimensions."""
-        from src.distillation import CKALoss
+        from src.training.losses import CKALoss
 
         cka = CKALoss()
         student = torch.randn(8, 64, 192)  # B, N, D_student
@@ -97,7 +97,7 @@ class TestCKALoss:
 
     def test_cka_self_similarity(self):
         """Verify CKA of identical representations is minimal (high similarity)."""
-        from src.distillation import CKALoss
+        from src.training.losses import CKALoss
 
         cka = CKALoss()
         x = torch.randn(8, 64, 192)
@@ -109,7 +109,7 @@ class TestCKALoss:
 
     def test_cka_different_batch_sizes(self):
         """Verify CKA handles various batch sizes."""
-        from src.distillation import CKALoss
+        from src.training.losses import CKALoss
 
         cka = CKALoss()
 
@@ -138,7 +138,6 @@ class TestCheckpointRNGState:
             model=model,
             optimizer=optimizer,
             scheduler=None,
-            scaler=None,
             swa_model=None,
             epoch=0,
             metrics={'loss': 0.5},
