@@ -1,201 +1,111 @@
 """
-Combined self-supervised distillation loss.
-
-Combines multiple loss components with staged training support:
-- L_ce: Cross-entropy classification loss
-- L_tok: Token representation loss (primary signal)
-- L_rel: Token correlation loss (regularizer, added after warmup)
-- L_cka: CKA structural loss (optional)
-- L_gram: Gram matrix loss (ablation)
-
-Reference: Chen et al., "Cross-Architecture Self-supervised Video Representation
-Learning", CVPR 2022 (CST paper).
+BASD-v2 combined loss with one canonical implementation.
 """
 
 import torch
 import torch.nn as nn
 
-from src.training.losses.token import TokenRepresentationLoss, TokenCorrelationLoss
-from src.training.losses.structural import LayerWiseStructuralLoss
+from src.training.losses.attention import AttentionDistillationLoss
+from src.training.losses.curriculum import UncertaintyWeighting, WarmupSchedule
+from src.training.losses.frequency import SpectralMatchingLoss
+from src.training.losses.structural import GramAnchoringLoss
+from src.training.losses.token import RedundancySuppressionLoss
 
 
-class SelfSupervisedDistillationLoss(nn.Module):
-    """
-    Combined loss for CST-style self-supervised distillation.
-
-    L = L_ce + lambda_tok * L_tok + lambda_rel * L_rel + lambda_cka * L_cka + lambda_gram * L_gram
-
-    Supports staged training:
-    - Stage A (first rel_warmup_epochs): L = L_ce + L_tok
-    - Stage B (remaining epochs): Full loss with L_rel
-    - CKA/Gram losses enabled after cka_warmup_epochs
-
-    Structural losses (CKA, Gram) are the PRIMARY signal for structural distillation
-    experiments. Token losses (L_tok, L_rel) can be disabled when using structural losses.
-    """
+class BASDv2Loss(nn.Module):
+    """Unified BASD objective with all four distillation components enabled."""
 
     def __init__(self, base_criterion, student_dim, teacher_dim, config):
-        """
-        Args:
-            base_criterion: Base classification loss (e.g., LabelSmoothingCE)
-            student_dim: Student embedding dimension
-            teacher_dim: Teacher embedding dimension
-            config: SelfSupervisedDistillationConfig
-        """
         super().__init__()
         self.base_criterion = base_criterion
-        self.config = config
+        self.token_layers = config.token_layers
+        self.attn_layer_pairs = [tuple(p) for p in config.attn_layer_pairs]
 
-        # Token representation loss - PRIMARY
-        self.token_rep_loss = TokenRepresentationLoss(
+        self.rsd_loss = RedundancySuppressionLoss(
             student_dim=student_dim,
             teacher_dim=teacher_dim,
-            projection_dim=config.projection_dim,
-            num_layers=len(config.token_layers),
-            loss_type=config.token_loss_type
+            num_layers=len(self.token_layers),
+            kappa=config.rsd_kappa,
         )
+        self.gram_loss = GramAnchoringLoss()
+        self.attn_loss = AttentionDistillationLoss()
+        self.spectral_loss = SpectralMatchingLoss(num_bands=config.spectral_num_bands)
+        self.uncertainty = UncertaintyWeighting(['rsd', 'gram', 'attn', 'spectral'])
+        self.warmup_schedule = None
+        self.warmup_fraction = config.warmup_fraction
 
-        # Token correlation loss - REGULARIZER
-        self.token_corr_loss = TokenCorrelationLoss(
-            temperature=config.correlation_temperature,
-            loss_type=config.correlation_loss_type,
-            use_pooled=config.use_pooled_correlation
-        )
+    def set_total_steps(self, total_steps):
+        self.warmup_schedule = WarmupSchedule(total_steps, self.warmup_fraction)
 
-        # CKA structural loss (optional)
-        self.use_cka_loss = config.use_cka_loss
-        if self.use_cka_loss:
-            self.structural_loss = LayerWiseStructuralLoss(
-                student_dim=student_dim,
-                teacher_dim=teacher_dim,
-                projection_dim=config.projection_dim,
-                num_layers=len(config.token_layers),
-                use_cka=True,
-                use_gram=config.use_gram_loss,
-                cka_kernel=config.cka_kernel_type
+    def _compute_gram_loss(self, student_intermediates, raw_teacher_intermediates):
+        total_loss = 0.0
+        loss_dict = {}
+
+        for layer_idx in self.token_layers:
+            student_tokens = student_intermediates[layer_idx]
+            teacher_tokens = raw_teacher_intermediates[layer_idx]
+            teacher_interp = torch.nn.functional.interpolate(
+                teacher_tokens.transpose(1, 2),
+                size=student_tokens.shape[1],
+                mode='linear',
+                align_corners=False,
+            ).transpose(1, 2)
+            layer_loss = self.gram_loss(student_tokens, teacher_interp)
+            total_loss += layer_loss
+            loss_dict[f'gram_layer_{layer_idx}'] = layer_loss.item()
+
+        return total_loss / len(self.token_layers), loss_dict
+
+    def _compute_spectral_loss(self, student_intermediates, teacher_intermediates):
+        total_loss = 0.0
+        loss_dict = {}
+
+        for layer_idx in self.token_layers:
+            layer_loss = self.spectral_loss(
+                student_intermediates[layer_idx],
+                teacher_intermediates[layer_idx],
             )
-            self.lambda_cka = config.lambda_cka
-            self.cka_warmup_epochs = config.cka_warmup_epochs
-        else:
-            self.structural_loss = None
-            self.lambda_cka = 0.0
-            self.cka_warmup_epochs = 0
+            total_loss += layer_loss
+            loss_dict[f'spectral_layer_{layer_idx}'] = layer_loss.item()
 
-        # Gram matrix loss (ablation - standalone without CKA)
-        self.use_gram_loss = config.use_gram_loss
-        if self.use_gram_loss and not self.use_cka_loss:
-            self.gram_only_loss = LayerWiseStructuralLoss(
-                student_dim=student_dim,
-                teacher_dim=teacher_dim,
-                projection_dim=config.projection_dim,
-                num_layers=len(config.token_layers),
-                use_cka=False,
-                use_gram=True
-            )
-            self.lambda_gram = config.lambda_gram
-        else:
-            self.gram_only_loss = None
-            self.lambda_gram = config.lambda_gram if self.use_cka_loss else 0.0
+        return total_loss / len(self.token_layers), loss_dict
 
-        self.lambda_tok = config.lambda_tok
-        self.lambda_rel = config.lambda_rel
-        self.token_layers = config.token_layers
+    def forward(
+        self,
+        student_output,
+        targets,
+        student_intermediates,
+        teacher_intermediates,
+        raw_teacher_intermediates,
+        student_attns,
+        teacher_attns,
+        global_step,
+    ):
+        """Compute the full BASD objective."""
+        ce_loss = self.base_criterion(student_output, targets)
+        rsd_loss, rsd_dict = self.rsd_loss(student_intermediates, teacher_intermediates, self.token_layers)
+        gram_loss, gram_dict = self._compute_gram_loss(student_intermediates, raw_teacher_intermediates)
+        attn_loss = self.attn_loss(student_attns, teacher_attns, self.attn_layer_pairs)
+        spectral_loss, spectral_dict = self._compute_spectral_loss(student_intermediates, teacher_intermediates)
 
-    def get_effective_lambda_rel(self, epoch):
-        """Get effective lambda_rel considering warmup."""
-        if epoch < self.config.rel_warmup_epochs:
-            return 0.0  # Stage A: no correlation loss
-        return self.lambda_rel  # Stage B: add L_rel
-
-    def get_effective_lambda_cka(self, epoch):
-        """Get effective lambda_cka considering warmup."""
-        if not self.use_cka_loss:
-            return 0.0
-        if epoch < self.cka_warmup_epochs:
-            return 0.0
-        return self.lambda_cka
-
-    def forward(self, student_output, targets,
-                student_intermediates, teacher_intermediates,
-                student_patch_tokens, teacher_patch_tokens,
-                epoch):
-        """
-        Compute combined distillation loss.
-
-        Args:
-            student_output: (cls_logits, dist_logits) or cls_logits
-            targets: Ground truth labels
-            student_intermediates: Dict of intermediate student tokens
-            teacher_intermediates: Dict of intermediate teacher tokens
-            student_patch_tokens: Final student patch tokens (B, N, d_s)
-            teacher_patch_tokens: Final teacher patch tokens (B, N, d_t)
-            epoch: Current epoch for staged training
-
-        Returns:
-            total_loss: Combined loss
-            loss_dict: Individual loss components
-        """
-        # Classification loss (on student CLS head ONLY - critical!)
-        cls_output, dist_output = student_output
-
-        ce_loss = self.base_criterion(cls_output, targets)
-
-        # Token representation loss (PRIMARY - always on)
-        tok_loss, tok_loss_dict = self.token_rep_loss(
-            student_intermediates, teacher_intermediates, self.token_layers
-        )
-
-        # Token correlation loss (REGULARIZER - staged)
-        effective_lambda_rel = self.get_effective_lambda_rel(epoch)
-        if effective_lambda_rel > 0:
-            rel_loss = self.token_corr_loss(student_patch_tokens, teacher_patch_tokens)
-        else:
-            rel_loss = torch.tensor(0.0, device=ce_loss.device)
-
-        # CKA/Gram structural loss (optional - staged)
-        effective_lambda_cka = self.get_effective_lambda_cka(epoch)
-        cka_loss = torch.tensor(0.0, device=ce_loss.device)
-        gram_loss = torch.tensor(0.0, device=ce_loss.device)
-        structural_loss_dict = {}
-
-        if self.structural_loss is not None and effective_lambda_cka > 0:
-            struct_loss, structural_loss_dict = self.structural_loss(
-                student_intermediates, teacher_intermediates, self.token_layers
-            )
-            if self.use_cka_loss:
-                cka_loss = struct_loss
-            if self.use_gram_loss and 'gram_loss_total' in structural_loss_dict:
-                gram_loss = torch.tensor(structural_loss_dict['gram_loss_total'], device=ce_loss.device)
-
-        # Gram-only loss (ablation without CKA)
-        if self.gram_only_loss is not None and epoch >= self.cka_warmup_epochs:
-            gram_struct_loss, gram_loss_dict = self.gram_only_loss(
-                student_intermediates, teacher_intermediates, self.token_layers
-            )
-            gram_loss = gram_struct_loss
-            structural_loss_dict.update(gram_loss_dict)
-
-        # Combined loss
-        total_loss = (
-            ce_loss
-            + self.lambda_tok * tok_loss
-            + effective_lambda_rel * rel_loss
-            + effective_lambda_cka * cka_loss
-        )
-        if self.gram_only_loss is not None:
-            total_loss = total_loss + self.lambda_gram * gram_loss
-
-        loss_dict = {
-            'ce_loss': ce_loss.item(),
-            'tok_loss': tok_loss.item(),
-            'rel_loss': rel_loss.item(),
-            'cka_loss': cka_loss.item(),
-            'gram_loss': gram_loss.item(),
-            'effective_lambda_rel': effective_lambda_rel,
-            'effective_lambda_cka': effective_lambda_cka,
-            'total_loss': total_loss.item(),
-            **tok_loss_dict,
-            **structural_loss_dict
+        raw_losses = {
+            'rsd': self.warmup_schedule.get_ramp('rsd', global_step) * rsd_loss,
+            'gram': self.warmup_schedule.get_ramp('gram', global_step) * gram_loss,
+            'attn': self.warmup_schedule.get_ramp('attn', global_step) * attn_loss,
+            'spectral': self.warmup_schedule.get_ramp('spectral', global_step) * spectral_loss,
         }
+        weighted_sum, weight_info = self.uncertainty(raw_losses)
+        total_loss = ce_loss + weighted_sum
 
-        return total_loss, loss_dict
+        return total_loss, {
+            'ce_loss': ce_loss.item(),
+            'rsd_loss': rsd_loss.item(),
+            'gram_loss': gram_loss.item(),
+            'attn_loss': attn_loss.item(),
+            'spectral_loss': spectral_loss.item(),
+            'total_loss': total_loss.item(),
+            **weight_info,
+            **rsd_dict,
+            **gram_dict,
+            **spectral_dict,
+        }

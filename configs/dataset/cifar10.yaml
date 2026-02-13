@@ -1,9 +1,0 @@
-# CIFAR-10 data settings
-data:
-  dataset: cifar
-  data_path: ./data
-  augmentation:
-    random_crop: true
-    random_flip: true
-    trivial_augment: true
-    cutout: true

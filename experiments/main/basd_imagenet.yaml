@@ -1,0 +1,29 @@
+experiment_name: basd_imagenet
+data:
+  dataset: imagenet
+  batch_size: 256
+  augmentation:
+    random_crop: true
+    random_flip: true
+    trivial_augment: true
+    cutout: true
+
+model: {}
+
+vit:
+  img_size: 224
+  patch_size: 16
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  drop_path_rate: 0.1
+
+training:
+  num_epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.05
+
+basd:
+  teacher_model_name: dinov2_vits14
+  token_layers: [3, 6, 9, 11]
+  warmup_fraction: 0.1

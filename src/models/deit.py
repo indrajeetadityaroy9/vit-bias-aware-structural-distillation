@@ -2,18 +2,16 @@
 Data-efficient Image Transformer (DeiT) for H100 GPUs.
 
 Uses Flash Attention via SDPA and gradient checkpointing by default.
+Distillation token removed — BASD uses structural losses instead.
 """
 
 import math
-from typing import Optional, Dict, List
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
-from src.models.registry import register_model
-
 
 class DropPath(nn.Module):
     """Stochastic depth regularization."""
@@ -32,44 +30,26 @@ class DropPath(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """Patch embedding with optional conv stem."""
+    """Patch embedding via linear projection."""
 
-    def __init__(self, img_size: int, patch_size: int, in_channels: int, embed_dim: int, use_conv_stem: bool = False):
+    def __init__(self, img_size: int, patch_size: int, in_channels: int, embed_dim: int):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2
-
-        if use_conv_stem:
-            self.stem = nn.Sequential(
-                nn.Conv2d(in_channels, embed_dim // 2, 3, 1, 1, bias=False),
-                nn.BatchNorm2d(embed_dim // 2),
-                nn.GELU(),
-                nn.Conv2d(embed_dim // 2, embed_dim, 3, 1, 1, bias=False),
-                nn.BatchNorm2d(embed_dim),
-                nn.GELU(),
-            )
-            self.proj = nn.Conv2d(embed_dim, embed_dim, patch_size, patch_size)
-        else:
-            self.stem = None
-            self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, patch_size)
+        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, patch_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.stem is not None:
-            x = self.stem(x)
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
 class Attention(nn.Module):
     """Multi-head attention with Flash Attention via SDPA."""
 
-    def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3)
-        self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        self.attn_weights: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, return_attention: bool = False) -> torch.Tensor:
         B, N, C = x.shape
@@ -83,36 +63,35 @@ class Attention(nn.Module):
             self.attn_weights = attn.detach()
             x = attn @ v
         else:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop if self.training else 0.0)
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        return self.proj_drop(self.proj(x))
+        return self.proj(x)
 
 
 class MLP(nn.Module):
     """MLP with GELU."""
 
-    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0):
+    def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, dim)
-        self.drop = nn.Dropout(drop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.fc2(self.drop(self.act(self.fc1(x)))))
+        return self.fc2(self.act(self.fc1(x)))
 
 
 class Block(nn.Module):
     """Transformer block."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, drop: float = 0.0, attn_drop: float = 0.0, drop_path: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, attn_drop, drop)
+        self.attn = Attention(dim, num_heads)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
+        self.mlp = MLP(dim, int(dim * mlp_ratio))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path(self.attn(self.norm1(x)))
@@ -120,64 +99,51 @@ class Block(nn.Module):
         return x
 
 
-@register_model('deit')
 class DeiT(nn.Module):
     """
-    DeiT with distillation token.
+    DeiT without distillation token.
 
+    BASD uses structural losses (CKA, attention, frequency) instead of
+    a distillation token. Only CLS token + patch tokens.
     Gradient checkpointing enabled by default for memory efficiency.
     """
 
     def __init__(self, config: dict):
         super().__init__()
 
-        in_channels = config.get('in_channels', 3)
-        num_classes = config.get('num_classes', 10)
-        img_size = config.get('img_size', 32)
-        patch_size = config.get('patch_size', 4)
-        embed_dim = config.get('embed_dim', 192)
-        depth = config.get('depth', 12)
-        num_heads = config.get('num_heads', 3)
-        mlp_ratio = config.get('mlp_ratio', 4.0)
-        drop_rate = config.get('drop_rate', 0.0)
-        attn_drop_rate = config.get('attn_drop_rate', 0.0)
-        drop_path_rate = config.get('drop_path_rate', 0.1)
-        use_conv_stem = config.get('use_conv_stem', False)
+        in_channels = config['in_channels']
+        num_classes = config['num_classes']
+        img_size = config['img_size']
+        patch_size = config['patch_size']
+        embed_dim = config['embed_dim']
+        depth = config['depth']
+        num_heads = config['num_heads']
+        drop_path_rate = config['drop_path_rate']
 
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.depth = depth
-        # Grayscale expansion
-        if in_channels == 1:
-            self.channel_expand = nn.Conv2d(1, 3, 1, bias=False)
-            in_channels = 3
-        else:
-            self.channel_expand = None
 
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim, use_conv_stem)
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 2, embed_dim))
-        self.pos_drop = nn.Dropout(drop_rate)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))  # CLS + patches
 
         dpr = torch.linspace(0, drop_path_rate, depth).tolist()
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, drop_rate, attn_drop_rate, dpr[i])
+            Block(embed_dim, num_heads, 4.0, dpr[i])
             for i in range(depth)
         ])
 
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
-        self.head_dist = nn.Linear(embed_dim, num_classes)
 
         self._init_weights()
 
     def _init_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.dist_token, std=0.02)
         self.apply(self._init_module)
 
     def _init_module(self, m):
@@ -195,13 +161,10 @@ class DeiT(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.channel_expand is not None:
-            x = self.channel_expand(x)
-
         B = x.shape[0]
         x = self.patch_embed(x)
-        x = torch.cat([self.cls_token.expand(B, -1, -1), self.dist_token.expand(B, -1, -1), x], dim=1)
-        x = self.pos_drop(x + self.pos_embed)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        x = x + self.pos_embed
 
         if self.training:
             for block in self.blocks:
@@ -211,71 +174,55 @@ class DeiT(nn.Module):
                 x = block(x)
 
         x = self.norm(x)
-        cls_out = self.head(x[:, 0])
-        dist_out = self.head_dist(x[:, 1])
+        return self.head(x[:, 0])
 
-        if self.training:
-            return cls_out, dist_out
-        return (cls_out + dist_out) / 2
+    def forward_with_intermediates(self, x: torch.Tensor, layer_indices: List[int]) -> Dict:
+        """
+        Forward pass with intermediate outputs and attention weights for BASD.
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract features before classification head."""
-        if self.channel_expand is not None:
-            x = self.channel_expand(x)
+        For layers in layer_indices, extracts patch token intermediates and
+        attention weights. Uses gradient checkpointing for non-captured layers.
 
-        B = x.shape[0]
-        x = self.patch_embed(x)
-        x = torch.cat([self.cls_token.expand(B, -1, -1), self.dist_token.expand(B, -1, -1), x], dim=1)
-        x = self.pos_drop(x + self.pos_embed)
+        Args:
+            x: Input images (B, C, H, W)
+            layer_indices: List of block indices to capture intermediates from
 
-        for block in self.blocks:
-            x = block(x)
-
-        return self.norm(x)
-
-    def forward_with_intermediates(self, x: torch.Tensor, layer_indices: List[int] = None) -> Dict:
-        """Forward with intermediate outputs for distillation."""
-        layer_indices = layer_indices or []
+        Returns:
+            Dict with keys:
+                'output': Classification logits (B, num_classes)
+                'intermediates': Dict[layer_idx] → (B, N_patches, embed_dim) patch tokens
+                'patch_tokens': (B, N_patches, embed_dim) final patch tokens
+                'attention_weights': Dict[layer_idx] → (B, H, N, N) attention weights
+        """
+        layer_set = set(layer_indices)
         intermediates = {}
-
-        if self.channel_expand is not None:
-            x = self.channel_expand(x)
+        attention_weights = {}
 
         B = x.shape[0]
         x = self.patch_embed(x)
-        x = torch.cat([self.cls_token.expand(B, -1, -1), self.dist_token.expand(B, -1, -1), x], dim=1)
-        x = self.pos_drop(x + self.pos_embed)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        x = x + self.pos_embed
 
         for idx, block in enumerate(self.blocks):
-            x = block(x)
-            if idx in layer_indices:
-                intermediates[idx] = x[:, 2:, :].clone()  # Patch tokens only
+            if idx in layer_set:
+                # Compute attention once and reuse output (no double compute)
+                normed = block.norm1(x)
+                attn_out = block.attn(normed, return_attention=True)
+                attention_weights[idx] = block.attn.attn_weights
+                x = x + block.drop_path(attn_out)
+                x = x + block.drop_path(block.mlp(block.norm2(x)))
+                intermediates[idx] = x[:, 1:, :].clone()  # Patch tokens only (skip CLS)
+            elif self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.norm(x)
         cls_out = self.head(x[:, 0])
-        dist_out = self.head_dist(x[:, 1])
 
         return {
-            'output': (cls_out, dist_out) if self.training else (cls_out + dist_out) / 2,
+            'output': cls_out,
             'intermediates': intermediates,
-            'patch_tokens': x[:, 2:, :]
+            'patch_tokens': x[:, 1:, :],
+            'attention_weights': attention_weights,
         }
-
-    def get_attention_weights(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
-        """Extract attention weights."""
-        if self.channel_expand is not None:
-            x = self.channel_expand(x)
-
-        B = x.shape[0]
-        x = self.patch_embed(x)
-        x = torch.cat([self.cls_token.expand(B, -1, -1), self.dist_token.expand(B, -1, -1), x], dim=1)
-        x = self.pos_drop(x + self.pos_embed)
-
-        weights = {}
-        for idx, block in enumerate(self.blocks):
-            block.attn(block.norm1(x), return_attention=True)
-            if block.attn.attn_weights is not None:
-                weights[idx] = block.attn.attn_weights
-            x = block(x)
-
-        return weights

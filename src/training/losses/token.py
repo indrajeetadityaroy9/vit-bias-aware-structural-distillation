@@ -1,13 +1,13 @@
 """
-Token-level distillation losses for self-supervised knowledge transfer.
+Token-level distillation via redundancy-suppressed cross-correlation.
 
 Implements:
-- ProjectionHead: Learnable dimension alignment
-- TokenRepresentationLoss (L_tok): Primary signal - matches intermediate embeddings
-- TokenCorrelationLoss (L_rel): Regularizer - matches token correlation structures
+- RedundancySuppressionLoss: Cross-correlation alignment with off-diagonal
+  suppression (Barlow Twins / RSD principle). Uses an Architecture-Agnostic
+  Decoupler (AAD) MLP to map student features to teacher dimension, then
+  drives the cross-correlation matrix toward identity.
 
-Reference: Chen et al., "Cross-Architecture Self-supervised Video Representation
-Learning", CVPR 2022 (CST paper).
+Reference: RSD (arXiv:2507.21844) — Redundancy Suppression Distillation.
 """
 
 import torch
@@ -15,60 +15,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ProjectionHead(nn.Module):
+class RedundancySuppressionLoss(nn.Module):
     """
-    Learnable projection head to align student/teacher embedding dimensions.
+    Cross-correlation alignment with redundancy suppression.
 
-    Architecture: Linear -> LayerNorm -> GELU -> Linear -> LayerNorm
-    This stabilizes cosine similarity and allows dimension mismatch handling.
+    Maximizes diagonal (invariance) and minimizes off-diagonal (decorrelation)
+    of the cross-correlation matrix between student and teacher features.
+
+    L_rsd = ||CC(h(z_s), z_t) - I||_F^2, off-diagonal weighted by kappa.
+
+    The AAD (Architecture-Agnostic Decoupler) is a 2-layer MLP that projects
+    student features to teacher dimension without requiring teacher-side
+    projectors (eliminates stop-gradient bug).
     """
 
-    def __init__(self, in_dim, out_dim, hidden_dim=None):
+    def __init__(self, student_dim, teacher_dim, num_layers, kappa=0.01):
+        """
+        Args:
+            student_dim: Student embedding dimension (D_s)
+            teacher_dim: Teacher embedding dimension (D_t)
+            num_layers: Number of distillation layers (one AAD per layer)
+            kappa: Off-diagonal penalty weight (default 0.01)
+        """
         super().__init__()
-        hidden_dim = hidden_dim or out_dim * 2
+        self.kappa = kappa
+        self.teacher_dim = teacher_dim
 
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-            nn.LayerNorm(out_dim)
-        )
-
-    def forward(self, x):
-        return self.proj(x)
-
-
-class TokenRepresentationLoss(nn.Module):
-    """
-    Token representation distillation loss (L_tok) - PRIMARY SIGNAL.
-
-    Matches intermediate layer embeddings between teacher and student
-    using learnable projection heads for dimension alignment.
-    """
-
-    def __init__(self, student_dim, teacher_dim, projection_dim, num_layers, loss_type='cosine'):
-        super().__init__()
-        self.loss_type = loss_type
-        self.num_layers = num_layers
-
-        # Separate projectors per layer - allows layer-specific alignment
-        self.student_projectors = nn.ModuleList([
-            ProjectionHead(student_dim, projection_dim)
-            for _ in range(num_layers)
-        ])
-        self.teacher_projectors = nn.ModuleList([
-            ProjectionHead(teacher_dim, projection_dim)
+        # One AAD per layer: student_dim -> hidden_dim -> teacher_dim
+        hidden_dim = max(student_dim, teacher_dim) * 2
+        self.aad_projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(student_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, teacher_dim),
+            )
             for _ in range(num_layers)
         ])
 
     def forward(self, student_intermediates, teacher_intermediates, layer_indices):
         """
-        Compute token representation loss.
+        Compute redundancy suppression loss across layers.
 
         Args:
-            student_intermediates: Dict[layer_idx] -> (B, N_s, d_s)
-            teacher_intermediates: Dict[layer_idx] -> (B, N_s, d_t) - already interpolated
+            student_intermediates: Dict[layer_idx] -> (B, N, D_s)
+            teacher_intermediates: Dict[layer_idx] -> (B, N, D_t) spatially aligned
             layer_indices: List of layer indices
 
         Returns:
@@ -79,91 +70,37 @@ class TokenRepresentationLoss(nn.Module):
         loss_dict = {}
 
         for i, layer_idx in enumerate(layer_indices):
-            student_tokens = student_intermediates[layer_idx]  # (B, N, d_s)
-            teacher_tokens = teacher_intermediates[layer_idx]  # (B, N, d_t)
+            student_tokens = student_intermediates[layer_idx]  # (B, N, D_s)
+            teacher_tokens = teacher_intermediates[layer_idx]  # (B, N, D_t)
 
-            # Project to common space
-            proj_student = self.student_projectors[i](student_tokens)  # (B, N, proj_dim)
-            proj_teacher = self.teacher_projectors[i](teacher_tokens)  # (B, N, proj_dim)
+            B, N, D_s = student_tokens.shape
+            D_t = self.teacher_dim
 
-            # Compute loss
-            if self.loss_type == 'cosine':
-                # Negative cosine similarity (minimize = maximize similarity)
-                proj_student_norm = F.normalize(proj_student, dim=-1)
-                proj_teacher_norm = F.normalize(proj_teacher, dim=-1)
-                layer_loss = 1 - (proj_student_norm * proj_teacher_norm).sum(dim=-1).mean()
-            else:  # mse
-                layer_loss = F.mse_loss(proj_student, proj_teacher)
+            # AAD: project student to teacher dimension
+            s_flat = self.aad_projectors[i](
+                student_tokens.reshape(-1, D_s)
+            ).reshape(B, N, D_t)
 
+            # L2 normalize along batch*token dimension
+            s_norm = F.normalize(s_flat.reshape(-1, D_t), dim=0)  # (B*N, D_t)
+            t_norm = F.normalize(teacher_tokens.detach().reshape(-1, D_t), dim=0)
+
+            # Cross-correlation matrix (D_t x D_t)
+            cc = s_norm.T @ t_norm  # (D_t, D_t)
+
+            # Target: identity matrix
+            target = torch.eye(D_t, device=cc.device)
+            diff = (cc - target).pow(2)
+
+            # Weight off-diagonal by kappa
+            off_diag = ~torch.eye(D_t, dtype=torch.bool, device=cc.device)
+            diff[off_diag] *= self.kappa
+
+            layer_loss = diff.mean()
             total_loss += layer_loss
-            loss_dict[f'tok_loss_layer_{layer_idx}'] = layer_loss.item()
+            loss_dict[f'rsd_layer_{layer_idx}'] = layer_loss.item()
 
-        # Average over layers
         total_loss = total_loss / len(layer_indices)
-        loss_dict['tok_loss_total'] = total_loss.item()
+        loss_dict['rsd_loss_total'] = total_loss.item()
 
         return total_loss, loss_dict
-
-
-class TokenCorrelationLoss(nn.Module):
-    """
-    Token correlation distillation loss (L_rel) - LIGHTWEIGHT REGULARIZER.
-
-    Matches token-token correlation matrices between teacher and student
-    for structural consistency. Uses patch-mean pooling to avoid O(N^2) cost.
-    """
-
-    def __init__(self, temperature=0.1, loss_type='kl', use_pooled=True):
-        super().__init__()
-        self.temperature = temperature
-        self.loss_type = loss_type
-        self.use_pooled = use_pooled
-
-    def forward(self, student_tokens, teacher_tokens):
-        """
-        Compute token correlation loss.
-
-        Args:
-            student_tokens: (B, N_s, d_s) patch tokens from student
-            teacher_tokens: (B, N_t, d_t) patch tokens from teacher
-
-        Returns:
-            loss: Scalar loss value
-        """
-        if self.use_pooled:
-            # Patch-mean pooling: (B, N, D) -> (B, D) - avoids N^2 correlation matrix
-            student_pooled = student_tokens.mean(dim=1)  # (B, D)
-            teacher_pooled = teacher_tokens.mean(dim=1)  # (B, D)
-
-            # Compute batch correlation: (B, B) matrix
-            student_norm = F.normalize(student_pooled, dim=-1)
-            teacher_norm = F.normalize(teacher_pooled, dim=-1)
-
-            student_corr = student_norm @ student_norm.T  # (B, B)
-            teacher_corr = teacher_norm @ teacher_norm.T  # (B, B)
-        else:
-            # Full correlation (expensive for large N)
-            student_norm = F.normalize(student_tokens, dim=-1)
-            teacher_norm = F.normalize(teacher_tokens, dim=-1)
-
-            # (B, N, N) correlation matrices
-            student_corr = torch.bmm(student_norm, student_norm.transpose(1, 2))
-            teacher_corr = torch.bmm(teacher_norm, teacher_norm.transpose(1, 2))
-
-        # Apply temperature and normalize
-        # Use log_softmax for student (numerically stable) and softmax for teacher
-        student_log_prob = F.log_softmax(student_corr / self.temperature, dim=-1)
-        teacher_prob = F.softmax(teacher_corr / self.temperature, dim=-1)
-
-        if self.loss_type == 'kl':
-            # KL divergence (more stable for probability matrices)
-            loss = F.kl_div(
-                student_log_prob,
-                teacher_prob,
-                reduction='batchmean'
-            )
-        else:  # frobenius
-            student_prob = F.softmax(student_corr / self.temperature, dim=-1)
-            loss = torch.norm(student_prob - teacher_prob, p='fro') / student_prob.numel()
-
-        return loss

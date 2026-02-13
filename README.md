@@ -1,99 +1,76 @@
-# Inductive Bias Mismatch in Heterogeneous Knowledge Distillation
+# BASD: Bias-Aware Structural Distillation (DINOv2 -> DeiT)
 
-Negative transfer phenomenon in CNN-to-ViT distillation. Negative transfer in CNN→ViT distillation stems from conflicting inductive biases—not weak teachers.
+Training mechanism for transferring representations from a frozen `DINOv2 ViT-S/14` teacher to a `DeiT-Tiny`-style student with structural distillation losses.
 
-1. **Alignment > Capacity**: Weaker teacher (ConvNeXt, 93.1%) produces better student (90.11%) than stronger teacher (ResNet-18, 95.1% → 90.05%)
-2. **Structure is 99.5% Sufficient**: Self-supervised structural distillation (DINOv2 → DeiT) achieves 89.69% using only geometric alignment
-3. **The "Locality Curse"**: CNN-distilled ViTs develop local attention (layer 2: 1.85 patch distance) vs DINOv2-distilled global attention (3.49, +88.6%)
+Standard KD with logits or a single feature loss under-utilizes the teacher when teacher/student token geometry and embedding spaces differ.
 
-## Usage
+The objective is to train a DeiT student using a unified multi-axis distillation objective that jointly aligns:
+- content statistics (`D x D`)
+- token structure (`N x N`)
+- attention routing (`H x N x N`)
+- frequency structure (2D spectrum)
 
-All training uses `torchrun` for distributed execution:
+1. Orthogonal feature decomposition for distillation:
+   content + structure + routing + spectral constraints in one objective.
+2. Learnable teacher->student token alignment:
+   cross-attention projector instead of naive geometric resizing.
+3. Automatic loss balancing:
+   homoscedastic uncertainty weighting instead of manual lambdas.
+4. Staggered curriculum:
+   cosine warmup ramps per component with fixed offsets.
+5. Deterministic training path:
+   one canonical `torchrun -m src <config>` route.
 
-### Standard Training
+## Integrated Mechanism
 
-```bash
-# Train CNN teacher
-torchrun --nproc_per_node=1 main.py train configs/cifar_improved_config.yaml
+Given student logits and intermediate tokens/attention from selected layers:
 
-# Train ResNet-18 teacher
-torchrun --nproc_per_node=1 main.py train configs/resnet18_cifar_config.yaml
+\[
+\mathcal{L}_{total}
+=
+\mathcal{L}_{CE}
+ + \mathcal{W}(
+r_{rsd}\mathcal{L}_{rsd},
+r_{gram}\mathcal{L}_{gram},
+r_{attn}\mathcal{L}_{attn},
+r_{spec}\mathcal{L}_{spec})
+\]
 
-# Train ConvNeXt V2 teacher
-torchrun --nproc_per_node=1 main.py train configs/convnext_v2_cifar_config.yaml
+where `r_*` are warmup ramps and `W` is uncertainty weighting.
 
-# Train DeiT baseline (no distillation)
-torchrun --nproc_per_node=1 main.py train configs/deit_cifar_config.yaml
-```
+### Teacher/Student Coupling
+- Teacher: frozen DINOv2 loaded from `torch.hub`
+- Student: DeiT with intermediate feature/attention extraction
+- Layer hooks extract teacher tokens and attention in one forward pass
+- Cross-attention projectors align teacher token count to student token count
 
-### CNN → DeiT Distillation
+### Distillation Components
+- `L_rsd` (content): cross-correlation identity matching with off-diagonal suppression
+- `L_gram` (structure): token-token Gram matrix matching
+- `L_attn` (routing): KL divergence between teacher/student attention distributions
+- `L_spec` (spectral): radial-band FFT magnitude matching
 
-```bash
-# First train a teacher, then distill
-torchrun --nproc_per_node=1 main.py train-distill configs/deit_cifar_config.yaml
-```
+### Optimization
+- DDP (`nccl`) with `torchrun`
+- BF16 autocast
+- AdamW + linear warmup + cosine decay
+- SWA late-phase averaging
+- early stopping on validation loss
+- gradient clipping
 
-### DINOv2 → DeiT Structural Distillation
+## References
 
-```bash
-# CKA structural alignment (primary method)
-torchrun --nproc_per_node=1 main.py train-ss-distill configs/deit_ss_distill_cka_cifar_config.yaml
-
-# Gram matrix ablation
-torchrun --nproc_per_node=1 main.py train-ss-distill configs/deit_ss_distill_gram_ablation_config.yaml
-
-# CE-only ablation (no structural loss)
-torchrun --nproc_per_node=1 main.py train-ss-distill configs/deit_ss_distill_cifar_ablation_ce_only.yaml
-```
-
-### Evaluation
-
-```bash
-python main.py evaluate configs/deit_cifar_config.yaml outputs/checkpoints/best_model.pth
-```
-
-### Analytics
-
-```bash
-# Run all analytics (hessian, attention, cka)
-python main.py analyze configs/deit_cifar_config.yaml outputs/checkpoints/best_model.pth
-
-# Specific metrics
-python main.py analyze configs/deit_cifar_config.yaml outputs/checkpoints/best_model.pth \
-    --metrics attention,cka \
-    --output-dir outputs/analytics
-```
-
-## Available Configs
-
-| Config | Description |
-|--------|-------------|
-| `cifar_improved_config.yaml` | AdaptiveCNN teacher |
-| `resnet18_cifar_config.yaml` | ResNet-18 teacher |
-| `convnext_v2_cifar_config.yaml` | ConvNeXt V2 teacher |
-| `deit_cifar_config.yaml` | DeiT student (standard/distill) |
-| `deit_ss_distill_cka_cifar_config.yaml` | DINOv2→DeiT with CKA loss |
-| `deit_ss_distill_gram_ablation_config.yaml` | Gram matrix ablation |
-| `deit_ss_distill_cifar_ablation_ce_only.yaml` | CE-only baseline |
-| `mnist_improved_config.yaml` | MNIST training |
-
-## Results
-
-### Transfer Efficiency
-
-| Teacher | Teacher Acc | Student Acc | Transfer Efficiency |
-|---------|-------------|-------------|---------------------|
-| None (baseline) | — | 86.02% | — |
-| ResNet-18 | 95.10% | 90.05% | 94.7% |
-| ConvNeXt V2 | 93.10% | **90.11%** | **96.8%** |
-| DINOv2 (structural) | N/A | 89.69% | — |
-
-### Attention Distance (The "Locality Curse")
-
-| Layer | ResNet→DeiT | ConvNeXt→DeiT | DINOv2→DeiT |
-|-------|-------------|---------------|-------------|
-| 2 | **1.85** | 2.20 | **3.49** (+88.6%) |
-| 3 | 2.68 | 2.33 | **3.56** (+32.8%) |
-| Mean | 3.31 | 3.28 | **3.73** (+12.7%) |
-
-CNN-distilled students exhibit attention collapse in layers 2-6. DINOv2-distilled students maintain global attention.
+1. DeiT (ICML 2021): https://arxiv.org/abs/2012.12877  
+   Student transformer design and distillation context (`models/deit.py`).
+2. DINOv2 (TMLR 2024): https://arxiv.org/abs/2304.07193  
+   Pretrained teacher loaded/frozen in `models/teachers.py`.
+3. Barlow Twins (ICML 2021): https://arxiv.org/abs/2103.03230  
+   Redundancy-reduction principle behind `L_rsd`.
+4. Redundancy Suppression Distillation: https://arxiv.org/abs/2507.21844  
+   Token-level cross-correlation loss (`training/losses/token.py`).
+5. DINOv3: https://arxiv.org/abs/2508.10104  
+   Structural Gram loss (`training/losses/structural.py`).
+6. SDKD Spectral Distillation: https://arxiv.org/abs/2507.02939  
+   FFT band-matching loss (`training/losses/frequency.py`).
+7. Uncertainty Weighting (CVPR 2018): https://arxiv.org/abs/1705.07115  
+   Adaptive multi-loss weighting (`training/losses/curriculum.py`).

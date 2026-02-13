@@ -1,6 +1,6 @@
 """
-Locality Curse Research Framework
+BASD (Bias-Aware Structural Distillation) Research Framework
 
-A research framework for studying inductive bias mismatch in heterogeneous
-knowledge distillation, specifically CNN-to-ViT transfer.
+A research framework for DINOv2→DeiT knowledge distillation with
+structural alignment losses and cosine curriculum scheduling.
 """

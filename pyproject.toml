@@ -10,11 +10,10 @@ dependencies = [
     "torch==2.2.0",
     "torchvision==0.17.0",
     "numpy==1.26.0",
-    "PyYAML==6.0",
+    "PyYAML==6.0.1",
     "tqdm==4.66.0",
-    "timm==0.9.12",
     "scikit-learn==1.4.0",
 ]
 
-[tool.setuptools]
-packages = ["src", "src.*"]
+[tool.setuptools.packages.find]
+include = ["src*"]

@@ -1,7 +1,0 @@
-# MNIST data settings
-data:
-  dataset: mnist
-  data_path: ./data
-  augmentation:
-    trivial_augment: true
-    cutout: true
