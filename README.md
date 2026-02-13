@@ -1,4 +1,4 @@
-# BASD: Bias-Aware Structural Distillation (DINOv2 -> DeiT)
+# BASD: Bias-Aware Structural Distillation
 
 Training mechanism for transferring representations from a frozen `DINOv2 ViT-S/14` teacher to a `DeiT-Tiny`-style student with structural distillation losses.
 
@@ -24,8 +24,7 @@ The objective is to train a DeiT student using a unified multi-axis distillation
 ## Integrated Mechanism
 
 Given student logits and intermediate tokens/attention from selected layers:
-
-\[
+```math
 \mathcal{L}_{total}
 =
 \mathcal{L}_{CE}
@@ -34,7 +33,7 @@ r_{rsd}\mathcal{L}_{rsd},
 r_{gram}\mathcal{L}_{gram},
 r_{attn}\mathcal{L}_{attn},
 r_{spec}\mathcal{L}_{spec})
-\]
+```
 
 where `r_*` are warmup ramps and `W` is uncertainty weighting.
 
