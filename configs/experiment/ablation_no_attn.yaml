@@ -1,0 +1,3 @@
+experiment_name: ablation_no_attn
+basd:
+  disable_components: [attn]

@@ -1,20 +1,28 @@
-"""
-Data-efficient Image Transformer (DeiT) for H100 GPUs.
+"""DeiT student model used for BASD distillation."""
 
-Uses Flash Attention via SDPA and gradient checkpointing by default.
-Distillation token removed — BASD uses structural losses instead.
-"""
+from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from vit_inductive_bias_distillation.config import ModelConfig, VitConfig
+
+__all__ = ["DeiT", "StudentIntermediates"]
+
+
+class StudentIntermediates(NamedTuple):
+    output: torch.Tensor
+    intermediates: dict[int, torch.Tensor]
+    attention_weights: dict[int, torch.Tensor]
+
+
 class DropPath(nn.Module):
-    """Stochastic depth regularization."""
+    """Stochastic depth."""
 
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -30,7 +38,7 @@ class DropPath(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """Patch embedding via linear projection."""
+    """Patch embedding layer."""
 
     def __init__(self, img_size: int, patch_size: int, in_channels: int, embed_dim: int):
         super().__init__()
@@ -42,7 +50,7 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head attention with Flash Attention via SDPA."""
+    """Multi-head attention with SDPA."""
 
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
@@ -51,7 +59,9 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_attention: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -60,17 +70,16 @@ class Attention(nn.Module):
             scale = self.head_dim ** -0.5
             attn = (q @ k.transpose(-2, -1)) * scale
             attn = attn.softmax(dim=-1)
-            self.attn_weights = attn.detach()
-            x = attn @ v
-        else:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            return self.proj(x), attn.detach()
 
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
 
 
 class MLP(nn.Module):
-    """MLP with GELU."""
+    """Two-layer MLP."""
 
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
@@ -100,53 +109,41 @@ class Block(nn.Module):
 
 
 class DeiT(nn.Module):
-    """
-    DeiT without distillation token.
+    """DeiT without distillation token; BASD distills via structural losses."""
 
-    BASD uses structural losses (CKA, attention, frequency) instead of
-    a distillation token. Only CLS token + patch tokens.
-    Gradient checkpointing enabled by default for memory efficiency.
-    """
-
-    def __init__(self, config: dict):
+    def __init__(self, vit_config: VitConfig, model_config: ModelConfig):
         super().__init__()
 
-        in_channels = config['in_channels']
-        num_classes = config['num_classes']
-        img_size = config['img_size']
-        patch_size = config['patch_size']
-        embed_dim = config['embed_dim']
-        depth = config['depth']
-        num_heads = config['num_heads']
-        drop_path_rate = config['drop_path_rate']
+        self.num_classes = model_config.num_classes
+        self.embed_dim = vit_config.embed_dim
+        self.depth = vit_config.depth
 
-        self.num_classes = num_classes
-        self.embed_dim = embed_dim
-        self.depth = depth
-
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
+        self.patch_embed = PatchEmbed(
+            vit_config.img_size, vit_config.patch_size,
+            model_config.in_channels, vit_config.embed_dim,
+        )
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))  # CLS + patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, vit_config.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, vit_config.embed_dim))
 
-        dpr = torch.linspace(0, drop_path_rate, depth).tolist()
+        dpr = torch.linspace(0, vit_config.drop_path_rate, vit_config.depth).tolist()
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, 4.0, dpr[i])
-            for i in range(depth)
+            Block(vit_config.embed_dim, vit_config.num_heads, 4.0, dpr[i])
+            for i in range(vit_config.depth)
         ])
 
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
+        self.norm = nn.LayerNorm(vit_config.embed_dim)
+        self.head = nn.Linear(vit_config.embed_dim, model_config.num_classes)
 
         self._init_weights()
 
-    def _init_weights(self):
+    def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_module)
 
-    def _init_module(self, m):
+    def _init_module(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
@@ -160,11 +157,15 @@ class DeiT(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply patch, CLS, and positional embeddings."""
         B = x.shape[0]
         x = self.patch_embed(x)
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
-        x = x + self.pos_embed
+        return x + self.pos_embed
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._embed(x)
 
         if self.training:
             for block in self.blocks:
@@ -176,42 +177,24 @@ class DeiT(nn.Module):
         x = self.norm(x)
         return self.head(x[:, 0])
 
-    def forward_with_intermediates(self, x: torch.Tensor, layer_indices: List[int]) -> Dict:
-        """
-        Forward pass with intermediate outputs and attention weights for BASD.
-
-        For layers in layer_indices, extracts patch token intermediates and
-        attention weights. Uses gradient checkpointing for non-captured layers.
-
-        Args:
-            x: Input images (B, C, H, W)
-            layer_indices: List of block indices to capture intermediates from
-
-        Returns:
-            Dict with keys:
-                'output': Classification logits (B, num_classes)
-                'intermediates': Dict[layer_idx] → (B, N_patches, embed_dim) patch tokens
-                'patch_tokens': (B, N_patches, embed_dim) final patch tokens
-                'attention_weights': Dict[layer_idx] → (B, H, N, N) attention weights
-        """
+    def forward_with_intermediates(
+        self, x: torch.Tensor, layer_indices: list[int]
+    ) -> StudentIntermediates:
+        """Forward pass with per-layer tokens and attention for BASD losses."""
         layer_set = set(layer_indices)
-        intermediates = {}
-        attention_weights = {}
+        intermediates: dict[int, torch.Tensor] = {}
+        attention_weights: dict[int, torch.Tensor] = {}
 
-        B = x.shape[0]
-        x = self.patch_embed(x)
-        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
-        x = x + self.pos_embed
+        x = self._embed(x)
 
         for idx, block in enumerate(self.blocks):
             if idx in layer_set:
-                # Compute attention once and reuse output (no double compute)
                 normed = block.norm1(x)
-                attn_out = block.attn(normed, return_attention=True)
-                attention_weights[idx] = block.attn.attn_weights
+                attn_out, attn_w = block.attn(normed, return_attention=True)
+                attention_weights[idx] = attn_w
                 x = x + block.drop_path(attn_out)
                 x = x + block.drop_path(block.mlp(block.norm2(x)))
-                intermediates[idx] = x[:, 1:, :].clone()  # Patch tokens only (skip CLS)
+                intermediates[idx] = x[:, 1:, :].clone()
             elif self.training:
                 x = checkpoint(block, x, use_reentrant=False)
             else:
@@ -220,9 +203,8 @@ class DeiT(nn.Module):
         x = self.norm(x)
         cls_out = self.head(x[:, 0])
 
-        return {
-            'output': cls_out,
-            'intermediates': intermediates,
-            'patch_tokens': x[:, 1:, :],
-            'attention_weights': attention_weights,
-        }
+        return StudentIntermediates(
+            output=cls_out,
+            intermediates=intermediates,
+            attention_weights=attention_weights,
+        )

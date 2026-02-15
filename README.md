@@ -18,8 +18,39 @@ The objective is to train a DeiT student using a unified multi-axis distillation
    homoscedastic uncertainty weighting instead of manual lambdas.
 4. Staggered curriculum:
    cosine warmup ramps per component with fixed offsets.
-5. Deterministic training path:
-   one canonical `torchrun -m src <config>` route.
+
+## Setup
+
+```bash
+pip install -e .
+```
+
+## Training
+
+```bash
+# Single GPU
+torchrun --nproc_per_node=1 --module vit_inductive_bias_distillation.train configs/experiment/basd_imagenet.yaml
+
+# Multi-GPU
+torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/basd_imagenet.yaml
+```
+
+## Evaluation
+
+```bash
+python -m vit_inductive_bias_distillation.eval configs/experiment/basd_imagenet.yaml
+```
+
+## Ablations (LOCO)
+
+Leave-One-Component-Out ablation configs disable individual loss components:
+
+```bash
+torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_rsd.yaml
+torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_gram.yaml
+torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_attn.yaml
+torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_spectral.yaml
+```
 
 ## Integrated Mechanism
 
@@ -59,17 +90,17 @@ where `r_*` are warmup ramps and `W` is uncertainty weighting.
 
 ## References
 
-1. DeiT (ICML 2021): https://arxiv.org/abs/2012.12877  
-   Student transformer design and distillation context (`models/deit.py`).
-2. DINOv2 (TMLR 2024): https://arxiv.org/abs/2304.07193  
-   Pretrained teacher loaded/frozen in `models/teachers.py`.
-3. Barlow Twins (ICML 2021): https://arxiv.org/abs/2103.03230  
+1. DeiT (ICML 2021): https://arxiv.org/abs/2012.12877
+   Student transformer design and distillation context (`vit_inductive_bias_distillation/models/deit.py`).
+2. DINOv2 (TMLR 2024): https://arxiv.org/abs/2304.07193
+   Pretrained teacher loaded/frozen in `vit_inductive_bias_distillation/models/teacher.py`.
+3. Barlow Twins (ICML 2021): https://arxiv.org/abs/2103.03230
    Redundancy-reduction principle behind `L_rsd`.
-4. Redundancy Suppression Distillation: https://arxiv.org/abs/2507.21844  
-   Token-level cross-correlation loss (`training/losses/token.py`).
-5. DINOv3: https://arxiv.org/abs/2508.10104  
-   Structural Gram loss (`training/losses/structural.py`).
-6. SDKD Spectral Distillation: https://arxiv.org/abs/2507.02939  
-   FFT band-matching loss (`training/losses/frequency.py`).
-7. Uncertainty Weighting (CVPR 2018): https://arxiv.org/abs/1705.07115  
-   Adaptive multi-loss weighting (`training/losses/curriculum.py`).
+4. Redundancy Suppression Distillation: https://arxiv.org/abs/2507.21844
+   Token-level cross-correlation loss (`vit_inductive_bias_distillation/losses/rsd.py`).
+5. DINOv3: https://arxiv.org/abs/2508.10104
+   Structural Gram loss (`vit_inductive_bias_distillation/losses/gram.py`).
+6. SDKD Spectral Distillation: https://arxiv.org/abs/2507.02939
+   FFT band-matching loss (`vit_inductive_bias_distillation/losses/spectral.py`).
+7. Uncertainty Weighting (CVPR 2018): https://arxiv.org/abs/1705.07115
+   Adaptive multi-loss weighting (`vit_inductive_bias_distillation/losses/weighting.py`).

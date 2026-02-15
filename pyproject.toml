@@ -13,7 +13,12 @@ dependencies = [
     "PyYAML==6.0.1",
     "tqdm==4.66.0",
     "scikit-learn==1.4.0",
+    "datasets>=3.0.0",
 ]
 
+[project.scripts]
+basd-train = "vit_inductive_bias_distillation.train:main"
+basd-eval = "vit_inductive_bias_distillation.eval:main"
+
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["vit_inductive_bias_distillation*"]

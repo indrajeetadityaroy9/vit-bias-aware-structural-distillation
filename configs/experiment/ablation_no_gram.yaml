@@ -1,0 +1,3 @@
+experiment_name: ablation_no_gram
+basd:
+  disable_components: [gram]
