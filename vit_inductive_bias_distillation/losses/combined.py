@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vit_inductive_bias_distillation.losses.attention import AttentionDistillationLoss
+from vit_inductive_bias_distillation.losses.layer_selector import GrassmannianLayerSelector
 from vit_inductive_bias_distillation.losses.relational import RelationalLoss
-from vit_inductive_bias_distillation.losses.layer_selector import SpectralLayerSelector
 from vit_inductive_bias_distillation.losses.rsd import RedundancySuppressionLoss
 from vit_inductive_bias_distillation.losses.spectral import SpectralMatchingLoss
 from vit_inductive_bias_distillation.losses.weighting import UncertaintyWeighting, WarmupSchedule
@@ -67,11 +67,17 @@ class BASDLoss(nn.Module):
         if LossComponent.SPECTRAL.value not in self.disabled:
             self.spectral_loss = SpectralMatchingLoss()
 
-        self.layer_selector = SpectralLayerSelector(
+        self.layer_selector = GrassmannianLayerSelector(
             num_extraction_points=len(self.token_layers),
+            student_dim=student_dim,
+            teacher_dim=teacher_dim,
             num_teacher_layers=config.num_teacher_layers,
             init_temperature=config.layer_selector_temperature,
-            entropy_weight=config.layer_selector_entropy_weight,
+            diversity_weight=config.layer_selector_diversity_weight,
+            recon_weight=config.layer_selector_recon_weight,
+            proj_dim=config.layer_selector_grass_proj_dim,
+            subspace_rank=config.layer_selector_grass_rank,
+            cov_eps=config.layer_selector_grass_cov_eps,
         )
 
         self.uncertainty = UncertaintyWeighting(
@@ -79,20 +85,31 @@ class BASDLoss(nn.Module):
         )
         self.warmup_schedule = WarmupSchedule(total_steps, config.warmup_fraction)
 
-    def _interpolate_tokens_2d(
+    def _interpolate_tokens(
         self, tokens: torch.Tensor, target_n: int
     ) -> torch.Tensor:
-        """2D bilinear interpolation of token sequences."""
+        """Interpolate token sequence length via 1D linear interpolation.
+
+        Architecture-agnostic: works for any token count N, not just
+        perfect squares. Each feature dimension is interpolated
+        independently across the sequence.
+
+        Args:
+            tokens: (B, N, D) token features.
+            target_n: Desired sequence length.
+
+        Returns:
+            (B, target_n, D) interpolated tokens.
+        """
         B, N, D = tokens.shape
         if N == target_n:
             return tokens
-        H_src = W_src = int(N ** 0.5)
-        H_tgt = W_tgt = int(target_n ** 0.5)
-        tokens_2d = tokens.transpose(1, 2).reshape(B, D, H_src, W_src)
-        tokens_2d = F.interpolate(
-            tokens_2d, (H_tgt, W_tgt), mode="bilinear", align_corners=False
+        # F.interpolate 1D expects (B, C, L) where C=channels, L=length
+        tokens_1d = tokens.transpose(1, 2)  # (B, D, N)
+        tokens_1d = F.interpolate(
+            tokens_1d, size=target_n, mode="linear", align_corners=False
         )
-        return tokens_2d.reshape(B, D, -1).transpose(1, 2)
+        return tokens_1d.transpose(1, 2)  # (B, target_n, D)
 
     def _compute_rel_loss(
         self,
@@ -106,8 +123,8 @@ class BASDLoss(nn.Module):
         for layer_idx in self.token_layers:
             student_tokens = student_intermediates[layer_idx]
             teacher_tokens = raw_teacher_intermediates[layer_idx]
-            # 2D bilinear interpolation to align token counts
-            teacher_tokens = self._interpolate_tokens_2d(
+            # 1D linear interpolation to align token counts
+            teacher_tokens = self._interpolate_tokens(
                 teacher_tokens, student_tokens.shape[1]
             )
             layer_loss = self.rel_loss(student_tokens, teacher_tokens)
@@ -128,8 +145,8 @@ class BASDLoss(nn.Module):
         for layer_idx in self.token_layers:
             s_tokens = student_intermediates[layer_idx]
             t_tokens = teacher_intermediates[layer_idx]
-            # 2D interpolation fallback for robustness
-            t_tokens = self._interpolate_tokens_2d(t_tokens, s_tokens.shape[1])
+            # 1D linear interpolation to align token counts
+            t_tokens = self._interpolate_tokens(t_tokens, s_tokens.shape[1])
             layer_loss = self.spectral_loss(s_tokens, t_tokens)
             total_loss = total_loss + layer_loss
             loss_dict[f"spectral_layer_{layer_idx}"] = layer_loss.item()
@@ -152,8 +169,8 @@ class BASDLoss(nn.Module):
         """Compute the full BASD objective."""
         ce_loss = self.base_criterion(student_output, targets)
 
-        # Adaptive spectral layer selection: mix teacher layers per extraction point
-        mixed_teachers, selector_info, entropy_loss = self.layer_selector(
+        # Grassmannian adaptive layer selection: mix teacher layers per extraction point
+        mixed_teachers, selector_info, reg_loss = self.layer_selector(
             student_intermediates, all_teacher_tokens, self.token_layers,
         )
         # Build new dicts with mixed teacher tokens (avoid mutating caller's dicts)
@@ -212,9 +229,9 @@ class BASDLoss(nn.Module):
             loss_info.update(spectral_dict)
 
         weighted_sum, weight_info = self.uncertainty.forward(raw_losses)
-        total_loss = ce_loss + weighted_sum + entropy_loss
+        total_loss = ce_loss + weighted_sum + reg_loss
         loss_info.update(weight_info)
-        loss_info["entropy_loss"] = entropy_loss.item()
+        loss_info["selector_reg_loss"] = reg_loss.item()
         loss_info["total_loss"] = total_loss.item()
 
         return total_loss, loss_info

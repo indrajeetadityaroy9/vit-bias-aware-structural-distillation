@@ -1,12 +1,8 @@
-"""Spectral-guided layer selection utility for BASD.
+"""Layer profiling utility for BASD.
 
-Offline CLI tool that computes per-layer 2D spatial spectral energy profiles
-for student and teacher models, helping identify optimal extraction layers.
-
-Uses 2D spatial FFT (rfft2) on the token grid — physically meaningful because
-spatial frequencies capture real image structure (edges vs textures vs global
-patterns). Both student and teacher share the same 14x14 spatial grid, so
-frequency bins align perfectly with no dimension mismatch.
+Offline CLI tool that computes per-layer Grassmannian projection metric
+distances between student and teacher models, helping identify optimal
+extraction layers based on subspace geometry alignment.
 
 Usage:
     python -m vit_inductive_bias_distillation.analysis.spectral_profile \\
@@ -16,67 +12,63 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 
 from vit_inductive_bias_distillation.config import load_config
+from vit_inductive_bias_distillation.losses.layer_selector import _grassmann_subspace
 from vit_inductive_bias_distillation.models.deit import DeiT
 from vit_inductive_bias_distillation.models.teacher import load_teacher
 
 
-def spectral_energy(tokens: torch.Tensor) -> torch.Tensor:
-    """Compute mean spatial spectral energy from token features.
+@torch.no_grad()
+def grassmann_layer_distance(
+    s_tokens: torch.Tensor,
+    t_tokens: torch.Tensor,
+    proj_dim: int = 128,
+    subspace_rank: int = 16,
+    cov_eps: float = 1e-4,
+) -> float:
+    """Compute normalized Grassmannian projection metric distance between two token tensors.
 
-    Uses 2D spatial FFT on the token grid (H, W), averaged over batch
-    and channel dimensions.
-
-    Args:
-        tokens: (B, N, D) token features from a single layer.
-
-    Returns:
-        Scalar mean spectral energy.
-    """
-    B, N, D = tokens.shape
-    H = W = int(N ** 0.5)
-    spatial = tokens.permute(0, 2, 1).reshape(B, D, H, W)
-    freq = torch.fft.rfft2(spatial, norm="ortho")
-    energy = (freq.real ** 2 + freq.imag ** 2).mean()
-    return energy
-
-
-def spatial_spectral_profile(tokens: torch.Tensor) -> torch.Tensor:
-    """Compute 2D spatial spectral energy profile.
-
-    Produces an energy distribution over spatial frequency bins, averaged
-    over batch and channel dimensions. Output shape depends only on the
-    spatial grid size (not embedding dimension), so student and teacher
-    profiles are directly comparable.
+    Creates temporary random orthogonal projections to a common space,
+    extracts top-k subspaces, and computes the Grassmannian distance.
 
     Args:
-        tokens: (B, N, D) token features.
+        s_tokens: (B, N_s, D_s) student tokens.
+        t_tokens: (B, N_t, D_t) teacher tokens.
+        proj_dim: Dimension of the common projection space.
+        subspace_rank: Number of principal directions (k).
+        cov_eps: Covariance regularization.
 
     Returns:
-        (H * (W//2+1),) energy profile. For 14x14 grid: (112,).
+        Normalized Grassmannian distance in [0, 1] (lower = more aligned subspaces).
     """
-    B, N, D = tokens.shape
-    H = W = int(N ** 0.5)
-    spatial = tokens.permute(0, 2, 1).reshape(B, D, H, W)
-    freq = torch.fft.rfft2(spatial, norm="ortho")  # (B, D, H, W//2+1)
-    energy = (freq.real ** 2 + freq.imag ** 2).mean(dim=(0, 1))  # (H, W//2+1)
-    return energy.flatten()  # (H * (W//2+1),)
+    D_s = s_tokens.shape[2]
+    D_t = t_tokens.shape[2]
+    device = s_tokens.device
 
+    # Temporary orthogonal projections
+    proj_s = torch.empty(proj_dim, D_s, device=device)
+    proj_t = torch.empty(proj_dim, D_t, device=device)
+    nn.init.orthogonal_(proj_s)
+    nn.init.orthogonal_(proj_t)
 
-def cosine_sim_spectral(s_tokens: torch.Tensor, t_tokens: torch.Tensor) -> float:
-    """Compute cosine similarity between 2D spatial spectral energy profiles.
+    # Project to common space
+    s_flat = s_tokens.reshape(-1, D_s).float()
+    t_flat = t_tokens.reshape(-1, D_t).float()
+    z_s = s_flat @ proj_s.T  # (M_s, d)
+    z_t = t_flat @ proj_t.T  # (M_t, d)
 
-    Both inputs produce profiles of identical shape (determined by spatial
-    grid, not embedding dimension), so no truncation or alignment is needed.
-    """
-    s_profile = spatial_spectral_profile(s_tokens)
-    t_profile = spatial_spectral_profile(t_tokens)
-    return F.cosine_similarity(s_profile.unsqueeze(0), t_profile.unsqueeze(0)).item()
+    # Extract subspaces
+    U_s = _grassmann_subspace(z_s, subspace_rank, cov_eps)  # (d, k)
+    U_t = _grassmann_subspace(z_t, subspace_rank, cov_eps)  # (d, k)
+
+    # Grassmannian projection metric
+    gram_norm_sq = (U_s.T @ U_t).norm() ** 2
+    d_grass_sq = subspace_rank - gram_norm_sq
+    return (d_grass_sq / subspace_rank).clamp(min=0.0).item()
 
 
 @torch.no_grad()
@@ -86,11 +78,10 @@ def profile_layers(
     batch_size: int = 16,
     device: str = "cuda",
 ) -> None:
-    """Profile spectral energy for all 12 layers of student and teacher."""
+    """Profile Grassmannian distance between all student-teacher layer pairs."""
     config = load_config(config_path)
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
-    # Load models
     teacher_info = load_teacher(config.basd.teacher_model_name, dev)
     teacher = teacher_info.model
     student = DeiT(config.vit, config.model).to(dev).eval()
@@ -99,16 +90,13 @@ def profile_layers(
         ckpt = torch.load(checkpoint_path, map_location=dev, weights_only=False)
         student.load_state_dict(ckpt["model_state_dict"])
 
-    # Synthetic batch
     imgs = torch.randn(batch_size, 3, config.vit.img_size, config.vit.img_size, device=dev)
 
     all_layers = list(range(config.vit.depth))
 
-    # Student intermediates
     student_results = student(imgs, layer_indices=all_layers)
     s_intermediates = student_results.intermediates
 
-    # Teacher intermediates via hooks on all layers
     t_intermediates: dict[int, torch.Tensor] = {}
     hooks = []
     for layer_idx in all_layers:
@@ -123,41 +111,57 @@ def profile_layers(
         for h in hooks:
             h.remove()
 
-    # Compute profiles
-    print(f"\n{'Layer':>6} | {'Student Energy':>15} | {'Teacher Energy':>15} | {'Cosine Sim':>12}")
-    print("-" * 60)
+    proj_dim = config.basd.layer_selector_grass_proj_dim
+    rank = config.basd.layer_selector_grass_rank
+    cov_eps = config.basd.layer_selector_grass_cov_eps
 
-    s_energies = []
-    t_energies = []
-    for layer in all_layers:
-        s_tokens = s_intermediates.get(layer)
-        t_tokens = t_intermediates.get(layer)
+    # Grassmannian distance matrix
+    print(f"\nGrassmannian Distance Matrix (d_norm x 100, proj_dim={proj_dim}, rank={rank}):")
+    print(f"{'':>6}", end="")
+    for tl in all_layers:
+        print(f"  T{tl:>2}", end="")
+    print()
 
-        if s_tokens is None or t_tokens is None:
-            print(f"{layer:>6} | {'N/A':>15} | {'N/A':>15} | {'N/A':>12}")
+    for sl in all_layers:
+        s_tokens = s_intermediates.get(sl)
+        if s_tokens is None:
             continue
+        print(f"S{sl:>5}", end="")
+        for tl in all_layers:
+            t_tokens = t_intermediates.get(tl)
+            if t_tokens is None:
+                print(f" {'N/A':>4}", end="")
+                continue
+            d = grassmann_layer_distance(
+                s_tokens, t_tokens, proj_dim, rank, cov_eps
+            ) * 100
+            print(f" {d:>4.1f}", end="")
+        print()
 
-        s_e = spectral_energy(s_tokens).item()
-        t_e = spectral_energy(t_tokens).item()
-        cos_sim = cosine_sim_spectral(s_tokens, t_tokens)
-
-        s_energies.append((layer, s_e))
-        t_energies.append((layer, t_e))
-
-        print(f"{layer:>6} | {s_e:>15.4f} | {t_e:>15.4f} | {cos_sim:>12.4f}")
-
-    # Recommend layers with highest combined spectral energy
-    if s_energies:
-        combined = [(l, se + te) for (l, se), (_, te) in zip(s_energies, t_energies)]
-        combined.sort(key=lambda x: x[1], reverse=True)
-        top_4 = [l for l, _ in combined[:4]]
-        top_4.sort()
-        print(f"\nRecommended extraction layers (top-4 by spectral energy): {top_4}")
+    # Recommend extraction layers by minimum Grassmannian distance
+    print(f"\nRecommended extraction layers (min Grassmannian distance):")
+    for sl in config.basd.token_layers:
+        s_tokens = s_intermediates.get(sl)
+        if s_tokens is None:
+            continue
+        best_tl = min(
+            all_layers,
+            key=lambda tl: (
+                grassmann_layer_distance(
+                    s_tokens, t_intermediates[tl], proj_dim, rank, cov_eps
+                )
+                if tl in t_intermediates else float("inf")
+            ),
+        )
+        d = grassmann_layer_distance(
+            s_tokens, t_intermediates[best_tl], proj_dim, rank, cov_eps
+        ) * 100
+        print(f"  Student layer {sl} -> Teacher layer {best_tl} (d_norm x 100 = {d:.2f})")
 
 
 def main() -> None:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Spectral layer profiling for BASD")
+    parser = argparse.ArgumentParser(description="Layer profiling for BASD")
     parser.add_argument("config", type=str, help="Path to YAML config file")
     parser.add_argument("--checkpoint", type=str, default=None, help="Student checkpoint path")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for profiling")

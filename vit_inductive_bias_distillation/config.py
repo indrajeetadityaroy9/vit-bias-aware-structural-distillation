@@ -58,7 +58,11 @@ class BASDConfig:
     vrm_num_pairs: int = 128
     num_teacher_layers: int = 12
     layer_selector_temperature: float = 2.0
-    layer_selector_entropy_weight: float = 0.01
+    layer_selector_diversity_weight: float = 0.01
+    layer_selector_recon_weight: float = 0.01
+    layer_selector_grass_proj_dim: int = 128
+    layer_selector_grass_rank: int = 16
+    layer_selector_grass_cov_eps: float = 1e-4
     # Derived fields are computed in load_config().
     teacher_embed_dim: int = 0
     cross_attn_num_heads: int = 0

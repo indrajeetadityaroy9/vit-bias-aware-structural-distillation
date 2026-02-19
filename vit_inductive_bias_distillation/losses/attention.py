@@ -15,10 +15,12 @@ _ATTN_EPS: Final[float] = 1e-8
 
 
 class HeadAligner(nn.Module):
-    """Learnable 1x1 Conv2d for cross-layer head alignment (A2D).
+    """Learnable 1x1 Conv2d for cross-architecture head alignment (A2D).
 
     Maps total student attention heads to total teacher attention heads
-    with only (S_heads * T_heads) parameters.
+    with only (S_heads * T_heads) parameters. Uses Conv2d(kernel_size=1)
+    which acts as a per-position linear transform on the head dimension,
+    independent of token count or spatial structure.
     """
 
     def __init__(self, total_student_heads: int, total_teacher_heads: int):
@@ -74,8 +76,14 @@ class AttentionDistillationLoss(nn.Module):
         """Positive temperature via softplus reparameterization."""
         return F.softplus(self._raw_temperature)
 
-    def _align_spatial(self, attn: torch.Tensor, target_size: int) -> torch.Tensor:
-        """Interpolate attention matrices to the target token resolution."""
+    def _align_resolution(self, attn: torch.Tensor, target_size: int) -> torch.Tensor:
+        """Interpolate attention matrices to match target token count.
+
+        Treats the (N, N) attention matrix as a 2D function over
+        (query_index, key_index) and bilinearly resamples to align
+        student and teacher token counts. Architecture-agnostic:
+        operates in token-index space, not pixel space.
+        """
         B, H, N, _ = attn.shape
         if N == target_size:
             return attn
@@ -120,8 +128,8 @@ class AttentionDistillationLoss(nn.Module):
         for i, (_, t_layer) in enumerate(layer_pairs):
             t_attn = teacher_attns[t_layer]
 
-            # Spatially align teacher probs to student resolution
-            t_attn = self._align_spatial(t_attn, N_s)
+            # Align teacher attention maps to student token count
+            t_attn = self._align_resolution(t_attn, N_s)
 
             # Student: apply softmax with temperature to raw logits (single softmax)
             s_log_prob = F.log_softmax(aligned_per_layer[i] / T, dim=-1)
