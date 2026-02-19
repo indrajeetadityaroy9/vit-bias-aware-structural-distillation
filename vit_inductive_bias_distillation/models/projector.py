@@ -1,5 +1,3 @@
-"""Cross-attention projector for teacher-student token alignment."""
-
 from __future__ import annotations
 
 import torch
@@ -9,10 +7,7 @@ __all__ = ["CrossAttentionProjector"]
 
 
 class CrossAttentionProjector(nn.Module):
-    """Align teacher tokens to student token count with learned queries."""
-
     def __init__(self, num_student_tokens: int, teacher_dim: int, student_dim: int, num_heads: int = 4):
-        """Build the projector."""
         super().__init__()
         self.num_student_tokens = num_student_tokens
 
@@ -26,7 +21,6 @@ class CrossAttentionProjector(nn.Module):
         self.norm = nn.LayerNorm(student_dim)
 
     def forward(self, teacher_tokens: torch.Tensor) -> torch.Tensor:
-        """Project teacher tokens into the student token layout."""
         B = teacher_tokens.shape[0]
 
         kv = self.teacher_proj(teacher_tokens)

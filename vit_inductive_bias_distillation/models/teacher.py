@@ -1,124 +1,150 @@
-"""DINOv2 teacher loading and intermediate extraction."""
-
 from __future__ import annotations
 
 from typing import NamedTuple
 
+import timm
 import torch
 
+from vit_inductive_bias_distillation.runtime_log import log_event
+
 __all__ = [
-    "DINO_EMBED_DIMS",
     "load_teacher",
     "extract_intermediates",
     "TeacherModel",
     "TeacherIntermediates",
 ]
 
-DINO_EMBED_DIMS: dict[str, int] = {
-    "dinov2_vits14": 384,
-}
-
 
 class TeacherModel(NamedTuple):
     model: torch.nn.Module
     embed_dim: int
+    num_layers: int
+    num_heads: int
+    loader: str
+    feature_format: str
 
 
 class TeacherIntermediates(NamedTuple):
-    projected: dict[int, torch.Tensor]
-    raw: dict[int, torch.Tensor]
-    attentions: dict[int, torch.Tensor]
-    all_raw: dict[int, torch.Tensor]
+    all_tokens: dict[int, torch.Tensor]
+    all_attentions: dict[int, torch.Tensor]
+
+
+def _detect_feature_format(model: torch.nn.Module, device: torch.device) -> str:
+    probe = torch.zeros(1, 3, 224, 224, device=device)
+    features = model.forward_features(probe)
+    if features.dim() == 3:
+        return "token"
+    # For pretrained CNNs, channel width is larger than spatial dimensions.
+    return "nchw" if features.shape[1] > features.shape[3] else "nhwc"
 
 
 def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
-    """Load a frozen pretrained DINOv2 teacher."""
-    teacher_model = torch.hub.load("facebookresearch/dinov2", model_name)
-    embed_dim = DINO_EMBED_DIMS[model_name]
+    is_dinov2 = model_name.startswith("dinov2_")
 
-    teacher_model = teacher_model.to(device)
-    teacher_model.eval()
-    for param in teacher_model.parameters():
+    if is_dinov2:
+        model = torch.hub.load("facebookresearch/dinov2", model_name)
+    else:
+        model = timm.create_model(model_name, pretrained=True, num_classes=0)
+
+    model = model.to(device)
+    model.eval()
+    for param in model.parameters():
         param.requires_grad = False
 
-    print(model_name, embed_dim)
-    return TeacherModel(model=teacher_model, embed_dim=embed_dim)
+    if is_dinov2:
+        embed_dim = model.embed_dim
+        num_layers = len(model.blocks)
+        num_heads = model.blocks[0].attn.num_heads
+        feature_format = "token"
+        loader = "dinov2"
+    else:
+        embed_dim = model.num_features
+        num_layers = 1
+        num_heads = max(1, embed_dim // 64)
+        feature_format = _detect_feature_format(model, device)
+        loader = "timm"
+
+    log_event(
+        "teacher_loaded",
+        model=model_name,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        feature_format=feature_format,
+    )
+    return TeacherModel(
+        model=model,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        loader=loader,
+        feature_format=feature_format,
+    )
+
+
+def _extract_cnn(
+    teacher_model: torch.nn.Module,
+    x: torch.Tensor,
+    feature_format: str,
+) -> TeacherIntermediates:
+    features = teacher_model.forward_features(x)
+    if feature_format == "nhwc":
+        features = features.permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
+    else:
+        features = features.flatten(2).transpose(1, 2)
+    return TeacherIntermediates(all_tokens={0: features}, all_attentions={})
+
+
+def _extract_vit(
+    teacher_model: torch.nn.Module,
+    x: torch.Tensor,
+    num_layers: int,
+) -> TeacherIntermediates:
+    hooks: list[torch.utils.hooks.RemovableHook] = []
+    captured_tokens: dict[int, torch.Tensor] = {}
+    captured_attns: dict[int, torch.Tensor] = {}
+
+    for layer_idx in range(num_layers):
+        block = teacher_model.blocks[layer_idx]
+
+        def make_token_hook(idx: int):
+            def hook(module, input, output):
+                captured_tokens[idx] = output[:, 1:, :]
+            return hook
+        hooks.append(block.register_forward_hook(make_token_hook(layer_idx)))
+
+        def make_attn_hook(idx: int):
+            def hook(module, input, output):
+                batch_size, num_tokens, channels = input[0].shape
+                num_heads = module.num_heads
+                head_dim = channels // num_heads
+                qkv = module.qkv(input[0]).reshape(
+                    batch_size, num_tokens, 3, num_heads, head_dim
+                ).permute(2, 0, 3, 1, 4)
+                q, k, _ = qkv.unbind(0)
+                attn = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
+                captured_attns[idx] = attn.softmax(dim=-1).detach()
+            return hook
+        hooks.append(block.attn.register_forward_hook(make_attn_hook(layer_idx)))
+
+    teacher_model(x)
+    for hook in hooks:
+        hook.remove()
+
+    return TeacherIntermediates(
+        all_tokens={idx: captured_tokens[idx] for idx in sorted(captured_tokens)},
+        all_attentions={idx: captured_attns[idx] for idx in sorted(captured_attns)},
+    )
 
 
 @torch.no_grad()
 def extract_intermediates(
     teacher_model: torch.nn.Module,
     x: torch.Tensor,
-    token_layers: list[int],
-    attn_layers: list[int],
-    projectors: torch.nn.ModuleList,
-    all_token_layers: list[int] | None = None,
+    num_layers: int,
+    loader: str,
+    feature_format: str,
 ) -> TeacherIntermediates:
-    """Extract intermediate tokens and attention maps in one teacher pass.
-
-    Args:
-        teacher_model: Frozen DINOv2 teacher.
-        x: Input images (B, C, H, W).
-        token_layers: Layer indices for projection (paired with projectors).
-        attn_layers: Layer indices for attention extraction.
-        projectors: Cross-attention projectors (one per token_layer).
-        all_token_layers: Additional layers to extract raw tokens from
-            (for adaptive layer selection). When provided, raw tokens are
-            captured from all specified layers and returned in ``all_raw``.
-    """
-    hooks: list[torch.utils.hooks.RemovableHook] = []
-    captured_tokens: dict[int, torch.Tensor] = {}
-    captured_attns: dict[int, torch.Tensor] = {}
-    extract_token_layers = set(token_layers) | set(all_token_layers or [])
-    extract_attn_layers = set(attn_layers)
-    all_layers = extract_token_layers | extract_attn_layers
-
-    for layer_idx in all_layers:
-        block = teacher_model.blocks[layer_idx]
-
-        if layer_idx in extract_token_layers:
-            def make_token_hook(idx: int):
-                def hook(module, input, output):
-                    captured_tokens[idx] = output[:, 1:, :]
-                return hook
-            hooks.append(block.register_forward_hook(make_token_hook(layer_idx)))
-
-        if layer_idx in extract_attn_layers:
-            def make_attn_hook(idx: int):
-                def hook(module, input, output):
-                    batch_size, num_tokens, channels = input[0].shape
-                    num_heads = module.num_heads
-                    head_dim = channels // num_heads
-                    qkv = module.qkv(input[0]).reshape(
-                        batch_size, num_tokens, 3, num_heads, head_dim
-                    ).permute(2, 0, 3, 1, 4)
-                    q, k, _ = qkv.unbind(0)
-                    attn = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
-                    captured_attns[idx] = attn.softmax(dim=-1).detach()
-                return hook
-            hooks.append(block.attn.register_forward_hook(make_attn_hook(layer_idx)))
-
-    try:
-        teacher_model(x)
-    finally:
-        for hook in hooks:
-            hook.remove()
-
-    intermediates: dict[int, torch.Tensor] = {}
-    raw_intermediates: dict[int, torch.Tensor] = {}
-    for i, layer_idx in enumerate(token_layers):
-        raw_intermediates[layer_idx] = captured_tokens[layer_idx]
-        intermediates[layer_idx] = projectors[i](captured_tokens[layer_idx])
-
-    # All raw tokens for adaptive layer selection
-    all_raw: dict[int, torch.Tensor] = {
-        idx: captured_tokens[idx]
-        for idx in sorted(captured_tokens)
-    }
-
-    return TeacherIntermediates(
-        projected=intermediates,
-        raw=raw_intermediates,
-        attentions=captured_attns,
-        all_raw=all_raw,
-    )
+    if loader == "dinov2":
+        return _extract_vit(teacher_model, x, num_layers)
+    return _extract_cnn(teacher_model, x, feature_format)

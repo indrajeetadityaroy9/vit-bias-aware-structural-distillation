@@ -1,3 +1,8 @@
-experiment_name: ablation_no_rsd
+run:
+  name: ablation_no_rsd
+
+data:
+  dataset: imagenet1k
+
 basd:
   disable_components: [rsd]

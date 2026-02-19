@@ -1,5 +1,3 @@
-"""Redundancy-suppressed cross-correlation distillation loss."""
-
 from __future__ import annotations
 
 import torch
@@ -10,8 +8,6 @@ __all__ = ["RedundancySuppressionLoss"]
 
 
 class RedundancySuppressionLoss(nn.Module):
-    """Match student-teacher cross-correlation to identity with off-diagonal penalty."""
-
     def __init__(
         self,
         student_dim: int,
@@ -19,7 +15,6 @@ class RedundancySuppressionLoss(nn.Module):
         num_layers: int,
         kappa: float = 0.01,
     ):
-        """Build AAD projectors and suppression weight."""
         super().__init__()
         self.kappa = kappa
         self.teacher_dim = teacher_dim
@@ -41,7 +36,6 @@ class RedundancySuppressionLoss(nn.Module):
         teacher_intermediates: dict[int, torch.Tensor],
         layer_indices: list[int],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute averaged redundancy suppression loss across layers."""
         device = student_intermediates[layer_indices[0]].device
         total_loss = torch.tensor(0.0, device=device)
         loss_dict: dict[str, float] = {}
@@ -58,7 +52,7 @@ class RedundancySuppressionLoss(nn.Module):
             ).reshape(B, N, D_t)
 
             s_norm = F.normalize(s_flat.reshape(-1, D_t), dim=0)
-            # Teacher branch is frozen; detach prevents accidental gradient coupling.
+            # Detach teacher branch to keep gradients on student projectors only.
             t_norm = F.normalize(teacher_tokens.detach().reshape(-1, D_t), dim=0)
 
             cc = s_norm.T @ t_norm

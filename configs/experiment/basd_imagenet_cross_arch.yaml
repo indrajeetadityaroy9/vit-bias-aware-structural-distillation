@@ -1,0 +1,11 @@
+run:
+  name: basd_imagenet_cross_arch
+
+data:
+  dataset: imagenet1k
+
+model:
+  student_preset: deit_tiny
+
+basd:
+  teacher_model_name: convnext_tiny

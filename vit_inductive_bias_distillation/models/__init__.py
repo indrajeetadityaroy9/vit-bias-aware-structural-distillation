@@ -1,1 +1,0 @@
-"""BASD model components."""

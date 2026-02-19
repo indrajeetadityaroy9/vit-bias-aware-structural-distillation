@@ -1,3 +1,8 @@
-experiment_name: ablation_no_spectral
+run:
+  name: ablation_no_spectral
+
+data:
+  dataset: imagenet1k
+
 basd:
   disable_components: [spectral]

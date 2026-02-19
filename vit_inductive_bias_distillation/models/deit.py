@@ -1,5 +1,3 @@
-"""DeiT student model used for BASD distillation."""
-
 from __future__ import annotations
 
 import math
@@ -10,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from vit_inductive_bias_distillation.config import ModelConfig, VitConfig
+from vit_inductive_bias_distillation.config import Config
 
 __all__ = ["DeiT", "StudentIntermediates"]
 
@@ -22,8 +20,6 @@ class StudentIntermediates(NamedTuple):
 
 
 class DropPath(nn.Module):
-    """Stochastic depth."""
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -38,8 +34,6 @@ class DropPath(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """Patch embedding layer."""
-
     def __init__(self, img_size: int, patch_size: int, in_channels: int, embed_dim: int):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2
@@ -50,8 +44,6 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head attention with SDPA."""
-
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
@@ -79,8 +71,6 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Two-layer MLP."""
-
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
@@ -92,8 +82,6 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block."""
-
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -109,9 +97,7 @@ class Block(nn.Module):
 
 
 class DeiT(nn.Module):
-    """DeiT without distillation token; BASD distills via structural losses."""
-
-    def __init__(self, vit_config: VitConfig, model_config: ModelConfig):
+    def __init__(self, vit_config: Config, model_config: Config):
         super().__init__()
 
         self.num_classes = model_config.num_classes
@@ -158,29 +144,15 @@ class DeiT(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def _embed(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply patch, CLS, and positional embeddings."""
         B = x.shape[0]
         x = self.patch_embed(x)
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         return x + self.pos_embed
 
     def forward(
-        self, x: torch.Tensor, layer_indices: list[int] | None = None
-    ) -> torch.Tensor | StudentIntermediates:
-        """Forward pass. Returns logits when layer_indices is None, or
-        StudentIntermediates with per-layer tokens and attention when provided."""
+        self, x: torch.Tensor, layer_indices: list[int] = ()
+    ) -> StudentIntermediates:
         x = self._embed(x)
-
-        if layer_indices is None:
-            if self.training:
-                for block in self.blocks:
-                    x = checkpoint(block, x, use_reentrant=False)
-            else:
-                for block in self.blocks:
-                    x = block(x)
-
-            x = self.norm(x)
-            return self.head(x[:, 0])
 
         layer_set = set(layer_indices)
         intermediates: dict[int, torch.Tensor] = {}

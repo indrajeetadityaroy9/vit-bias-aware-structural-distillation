@@ -1,0 +1,17 @@
+run:
+  name: basd_cifar100
+
+data:
+  dataset: cifar100
+  batch_size: 128
+
+model:
+  student_preset: deit_tiny
+  vit:
+    img_size: 32
+    patch_size: 4
+
+training:
+  num_epochs: 200
+  learning_rate: 5e-4
+  weight_decay: 0.05

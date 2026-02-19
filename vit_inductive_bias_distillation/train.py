@@ -1,81 +1,61 @@
-"""BASD training entry point."""
-
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-from vit_inductive_bias_distillation.config import load_config, save_config
+from vit_inductive_bias_distillation.config import load_config
 from vit_inductive_bias_distillation.data import create_dataloaders
-from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
+from vit_inductive_bias_distillation.evaluation.suite import run_eval_suite, save_metrics
 from vit_inductive_bias_distillation.models.deit import DeiT
 from vit_inductive_bias_distillation.models.teacher import load_teacher
-from vit_inductive_bias_distillation.training import BASDTrainer, init_distributed, seed_everything
+from vit_inductive_bias_distillation.runtime_log import log_event
+from vit_inductive_bias_distillation.training import BASDTrainer, seed_everything
+from vit_inductive_bias_distillation.training.setup import setup_device
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BASD Training")
-    parser.add_argument("config", type=str, help="Path to experiment config YAML")
+    parser.add_argument("--config", type=str, required=True, help="Path to experiment config YAML")
     args = parser.parse_args()
 
-    rank, world_size, device = init_distributed()
+    device = setup_device()
     config = load_config(args.config)
-    seed_everything(config.seed, rank)
+    seed_everything(config.run.seed)
 
-    output_dir = Path(config.output_dir) / config.experiment_name
-    if rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        print(args.config, world_size, torch.cuda.get_device_name(0))
-
-    dist.barrier()
-
-    student = DeiT(config.vit, config.model).to(device)
-    student = DDP(student, device_ids=[device.index])
-    student = torch.compile(student, mode="max-autotune")
-
-    teacher = load_teacher(config.basd.teacher_model_name, device)
-
-    train_loader, train_sampler, val_loader = create_dataloaders(
-        config, world_size, rank
+    output_dir = Path(config.run.output_dir) / config.run.name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_event(
+        "train_start",
+        config_path=args.config,
+        device=str(device),
+        cuda_name=torch.cuda.get_device_name(0),
     )
 
-    total_steps = len(train_loader) * config.training.num_epochs
+    student = DeiT(config.model.vit, config.model).to(device)
+    teacher = load_teacher(config.basd.teacher_model_name, device)
+    train_loader, val_loader = create_dataloaders(config)
+
     trainer = BASDTrainer(
-        student, teacher.model, teacher.embed_dim, config,
-        device, rank, world_size, total_steps,
+        student, teacher, config,
+        device, steps_per_epoch=len(train_loader),
     )
 
     start_epoch = 0
-    if config.resume_from:
-        start_epoch = trainer.load_checkpoint(config.resume_from)
-        if rank == 0:
-            print(config.resume_from, start_epoch)
-
-    trainer.train_ddp(train_loader, train_sampler, val_loader, start_epoch=start_epoch)
-
-    if rank == 0:
-        metrics = evaluate_model(trainer.ddp_model.module, val_loader, device, trainer.criterion)
-        print(
-            metrics["accuracy"],
-            metrics["precision_macro"],
-            metrics["recall_macro"],
-            metrics["f1_macro"],
-            metrics["loss"],
+    if config.checkpoint.resume_from:
+        start_epoch = trainer.load_checkpoint(config.checkpoint.resume_from)
+        log_event(
+            "checkpoint_resumed",
+            path=config.checkpoint.resume_from,
+            start_epoch=start_epoch,
         )
 
-        save_config(config, output_dir / "config.yaml")
-        with open(output_dir / "results.txt", "w") as f:
-            f.write(f"BASD\n{'=' * 60}\n")
-            f.write(f"GPUs: {world_size}, Batch: {config.data.batch_size * world_size}\n")
-            f.write(f"Teacher: {config.basd.teacher_model_name}\n")
-            f.write(f"\nAccuracy: {metrics['accuracy']:.4f}\n")
-            f.write(f"F1 (macro): {metrics['f1_macro']:.4f}\n")
-        print(str(output_dir))
+    trainer.train(train_loader, val_loader, start_epoch=start_epoch)
 
-    dist.destroy_process_group()
+    results = run_eval_suite(trainer.model, config, device, config_path=args.config)
+    metrics_path = save_metrics(results, output_dir, config)
+    log_event("metrics_saved", path=str(metrics_path))
 
 
 if __name__ == "__main__":

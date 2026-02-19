@@ -1,12 +1,9 @@
-"""Combined BASD objective."""
-
 from __future__ import annotations
 
 from enum import Enum
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vit_inductive_bias_distillation.losses.attention import AttentionDistillationLoss
 from vit_inductive_bias_distillation.losses.layer_selector import GrassmannianLayerSelector
@@ -14,12 +11,12 @@ from vit_inductive_bias_distillation.losses.relational import RelationalLoss
 from vit_inductive_bias_distillation.losses.rsd import RedundancySuppressionLoss
 from vit_inductive_bias_distillation.losses.spectral import SpectralMatchingLoss
 from vit_inductive_bias_distillation.losses.weighting import UncertaintyWeighting, WarmupSchedule
+from vit_inductive_bias_distillation.models.projector import CrossAttentionProjector
 
 __all__ = ["BASDLoss", "LossComponent"]
 
 
 class LossComponent(str, Enum):
-    """Distillation loss component identifiers."""
     RSD = "rsd"
     REL = "rel"
     ATTN = "attn"
@@ -27,34 +24,42 @@ class LossComponent(str, Enum):
 
 
 class BASDLoss(nn.Module):
-    """Unified BASD objective with all four distillation components."""
-
     def __init__(
         self,
         base_criterion: nn.Module,
         student_dim: int,
         teacher_dim: int,
+        num_student_tokens: int,
+        cross_attn_num_heads: int,
         config,
         total_steps: int,
-        disable_components: list[str] | None = None,
+        disable_components: list[str] = (),
         student_num_heads: int = 3,
         teacher_num_heads: int = 6,
     ):
-        """Build the combined loss and schedules."""
         super().__init__()
         self.base_criterion = base_criterion
         self.token_layers = list(config.token_layers)
-        self.attn_layer_pairs = [tuple(p) for p in config.attn_layer_pairs]
-        self.disabled: set[str] = {c for c in (disable_components or [])}
+        self.disabled: set[str] = set(disable_components)
 
         active_components = [c.value for c in LossComponent if c.value not in self.disabled]
+
+        self.cross_attn_projectors = nn.ModuleList([
+            CrossAttentionProjector(
+                num_student_tokens=num_student_tokens,
+                teacher_dim=teacher_dim,
+                student_dim=teacher_dim,
+                num_heads=cross_attn_num_heads,
+            )
+            for _ in self.token_layers
+        ])
 
         if LossComponent.RSD.value not in self.disabled:
             self.rsd_loss = RedundancySuppressionLoss(
                 student_dim=student_dim,
                 teacher_dim=teacher_dim,
                 num_layers=len(self.token_layers),
-                kappa=config.rsd_kappa,
+                kappa=1.0 / teacher_dim,
             )
         if LossComponent.REL.value not in self.disabled:
             self.rel_loss = RelationalLoss(num_pairs=config.vrm_num_pairs)
@@ -62,7 +67,7 @@ class BASDLoss(nn.Module):
             self.attn_loss = AttentionDistillationLoss(
                 student_heads_per_layer=student_num_heads,
                 teacher_heads_per_layer=teacher_num_heads,
-                num_layers=len(self.attn_layer_pairs),
+                num_layers=len(self.token_layers),
             )
         if LossComponent.SPECTRAL.value not in self.disabled:
             self.spectral_loss = SpectralMatchingLoss()
@@ -71,7 +76,6 @@ class BASDLoss(nn.Module):
             num_extraction_points=len(self.token_layers),
             student_dim=student_dim,
             teacher_dim=teacher_dim,
-            num_teacher_layers=config.num_teacher_layers,
             init_temperature=config.layer_selector_temperature,
             diversity_weight=config.layer_selector_diversity_weight,
             recon_weight=config.layer_selector_recon_weight,
@@ -83,102 +87,32 @@ class BASDLoss(nn.Module):
         self.uncertainty = UncertaintyWeighting(
             active_components, temperature=config.uwso_temperature
         )
-        self.warmup_schedule = WarmupSchedule(total_steps, config.warmup_fraction)
-
-    def _interpolate_tokens(
-        self, tokens: torch.Tensor, target_n: int
-    ) -> torch.Tensor:
-        """Interpolate token sequence length via 1D linear interpolation.
-
-        Architecture-agnostic: works for any token count N, not just
-        perfect squares. Each feature dimension is interpolated
-        independently across the sequence.
-
-        Args:
-            tokens: (B, N, D) token features.
-            target_n: Desired sequence length.
-
-        Returns:
-            (B, target_n, D) interpolated tokens.
-        """
-        B, N, D = tokens.shape
-        if N == target_n:
-            return tokens
-        # F.interpolate 1D expects (B, C, L) where C=channels, L=length
-        tokens_1d = tokens.transpose(1, 2)  # (B, D, N)
-        tokens_1d = F.interpolate(
-            tokens_1d, size=target_n, mode="linear", align_corners=False
+        self.warmup_schedule = WarmupSchedule(
+            total_steps, config.warmup_fraction, stagger=vars(config.warmup_stagger),
         )
-        return tokens_1d.transpose(1, 2)  # (B, target_n, D)
-
-    def _compute_rel_loss(
-        self,
-        student_intermediates: dict[int, torch.Tensor],
-        raw_teacher_intermediates: dict[int, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        device = student_intermediates[self.token_layers[0]].device
-        total_loss = torch.tensor(0.0, device=device)
-        loss_dict: dict[str, float] = {}
-
-        for layer_idx in self.token_layers:
-            student_tokens = student_intermediates[layer_idx]
-            teacher_tokens = raw_teacher_intermediates[layer_idx]
-            # 1D linear interpolation to align token counts
-            teacher_tokens = self._interpolate_tokens(
-                teacher_tokens, student_tokens.shape[1]
-            )
-            layer_loss = self.rel_loss(student_tokens, teacher_tokens)
-            total_loss = total_loss + layer_loss
-            loss_dict[f"rel_layer_{layer_idx}"] = layer_loss.item()
-
-        return total_loss / len(self.token_layers), loss_dict
-
-    def _compute_spectral_loss(
-        self,
-        student_intermediates: dict[int, torch.Tensor],
-        teacher_intermediates: dict[int, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        device = student_intermediates[self.token_layers[0]].device
-        total_loss = torch.tensor(0.0, device=device)
-        loss_dict: dict[str, float] = {}
-
-        for layer_idx in self.token_layers:
-            s_tokens = student_intermediates[layer_idx]
-            t_tokens = teacher_intermediates[layer_idx]
-            # 1D linear interpolation to align token counts
-            t_tokens = self._interpolate_tokens(t_tokens, s_tokens.shape[1])
-            layer_loss = self.spectral_loss(s_tokens, t_tokens)
-            total_loss = total_loss + layer_loss
-            loss_dict[f"spectral_layer_{layer_idx}"] = layer_loss.item()
-
-        return total_loss / len(self.token_layers), loss_dict
 
     def forward(
         self,
         student_output: torch.Tensor,
         targets: torch.Tensor,
         student_intermediates: dict[int, torch.Tensor],
-        teacher_intermediates: dict[int, torch.Tensor],
-        raw_teacher_intermediates: dict[int, torch.Tensor],
-        all_teacher_tokens: dict[int, torch.Tensor],
         student_attns: dict[int, torch.Tensor],
-        teacher_attns: dict[int, torch.Tensor],
-        projectors: nn.ModuleList,
+        all_teacher_tokens: dict[int, torch.Tensor],
+        all_teacher_attns: dict[int, torch.Tensor],
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute the full BASD objective."""
         ce_loss = self.base_criterion(student_output, targets)
 
-        # Grassmannian adaptive layer selection: mix teacher layers per extraction point
-        mixed_teachers, selector_info, reg_loss = self.layer_selector(
-            student_intermediates, all_teacher_tokens, self.token_layers,
+        mixed_tokens, mixed_attns, selector_info, reg_loss = self.layer_selector(
+            student_intermediates, all_teacher_tokens, all_teacher_attns,
+            self.token_layers,
         )
-        # Build new dicts with mixed teacher tokens (avoid mutating caller's dicts)
-        raw_teacher_intermediates = dict(raw_teacher_intermediates)
-        teacher_intermediates = dict(teacher_intermediates)
+
+        aligned_tokens: dict[int, torch.Tensor] = {}
         for i, layer_idx in enumerate(self.token_layers):
-            raw_teacher_intermediates[layer_idx] = mixed_teachers[layer_idx]
-            teacher_intermediates[layer_idx] = projectors[i](mixed_teachers[layer_idx])
+            aligned_tokens[layer_idx] = self.cross_attn_projectors[i](
+                mixed_tokens[layer_idx]
+            )
 
         raw_losses: dict[str, torch.Tensor] = {}
         loss_info: dict[str, float] = {
@@ -192,7 +126,7 @@ class BASDLoss(nn.Module):
 
         if LossComponent.RSD.value not in self.disabled:
             rsd_loss, rsd_dict = self.rsd_loss(
-                student_intermediates, teacher_intermediates, self.token_layers
+                student_intermediates, aligned_tokens, self.token_layers
             )
             raw_losses[LossComponent.RSD.value] = (
                 self.warmup_schedule.get_ramp(LossComponent.RSD.value, global_step) * rsd_loss
@@ -201,9 +135,16 @@ class BASDLoss(nn.Module):
             loss_info.update(rsd_dict)
 
         if LossComponent.REL.value not in self.disabled:
-            rel_loss, rel_dict = self._compute_rel_loss(
-                student_intermediates, raw_teacher_intermediates
-            )
+            device = student_intermediates[self.token_layers[0]].device
+            rel_total = torch.tensor(0.0, device=device)
+            rel_dict: dict[str, float] = {}
+            for layer_idx in self.token_layers:
+                layer_loss = self.rel_loss(
+                    student_intermediates[layer_idx], aligned_tokens[layer_idx]
+                )
+                rel_total = rel_total + layer_loss
+                rel_dict[f"rel_layer_{layer_idx}"] = layer_loss.item()
+            rel_loss = rel_total / len(self.token_layers)
             raw_losses[LossComponent.REL.value] = (
                 self.warmup_schedule.get_ramp(LossComponent.REL.value, global_step) * rel_loss
             )
@@ -211,16 +152,23 @@ class BASDLoss(nn.Module):
             loss_info.update(rel_dict)
 
         if LossComponent.ATTN.value not in self.disabled:
-            attn_loss = self.attn_loss(student_attns, teacher_attns, self.attn_layer_pairs)
+            attn_loss = self.attn_loss(student_attns, mixed_attns, self.token_layers)
             raw_losses[LossComponent.ATTN.value] = (
                 self.warmup_schedule.get_ramp(LossComponent.ATTN.value, global_step) * attn_loss
             )
             loss_info["attn_loss"] = attn_loss.item()
 
         if LossComponent.SPECTRAL.value not in self.disabled:
-            spectral_loss, spectral_dict = self._compute_spectral_loss(
-                student_intermediates, teacher_intermediates
-            )
+            device = student_intermediates[self.token_layers[0]].device
+            spectral_total = torch.tensor(0.0, device=device)
+            spectral_dict: dict[str, float] = {}
+            for layer_idx in self.token_layers:
+                layer_loss = self.spectral_loss(
+                    student_intermediates[layer_idx], aligned_tokens[layer_idx]
+                )
+                spectral_total = spectral_total + layer_loss
+                spectral_dict[f"spectral_layer_{layer_idx}"] = layer_loss.item()
+            spectral_loss = spectral_total / len(self.token_layers)
             raw_losses[LossComponent.SPECTRAL.value] = (
                 self.warmup_schedule.get_ramp(LossComponent.SPECTRAL.value, global_step)
                 * spectral_loss
