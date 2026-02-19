@@ -65,4 +65,4 @@ def evaluate_model(
         "val_acc": 100.0 * correct / total,
     }
 
-    return {"metrics": metrics}
+    return metrics

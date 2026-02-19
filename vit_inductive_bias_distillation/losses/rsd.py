@@ -18,14 +18,13 @@ class RedundancySuppressionLoss(nn.Module):
         teacher_dim: int,
         num_layers: int,
         kappa: float = 0.01,
-        hidden_dim: int | None = None,
     ):
         """Build AAD projectors and suppression weight."""
         super().__init__()
         self.kappa = kappa
         self.teacher_dim = teacher_dim
 
-        hidden_dim = hidden_dim or max(student_dim, teacher_dim) * 2
+        hidden_dim = max(student_dim, teacher_dim) * 2
         self.aad_projectors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(student_dim, hidden_dim),

@@ -8,11 +8,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from vit_inductive_bias_distillation.config import load_config, save_config
-from vit_inductive_bias_distillation.data import create_dataloaders
+from vit_inductive_bias_distillation.data.datasets import ImageNetDataset
+from vit_inductive_bias_distillation.data.transforms import build_eval_transform
 from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
-from vit_inductive_bias_distillation.models import build_student_model
+from vit_inductive_bias_distillation.models.deit import DeiT
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BASD Evaluation")
@@ -25,17 +27,24 @@ def main() -> None:
     if not config.checkpoint:
         raise ValueError("config.checkpoint must be set for evaluation")
 
-    model = build_student_model(config, device)
+    model = DeiT(config.vit, config.model).to(device)
 
     ckpt = torch.load(config.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     print(config.checkpoint, ckpt["epoch"])
 
-    _, _, _, test_loader = create_dataloaders(config, world_size=1, rank=0, with_augmentation=False)
+    eval_transform = build_eval_transform(config)
+    val_dataset = ImageNetDataset("val", eval_transform)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
-    results = evaluate_model(model, test_loader, device, criterion)
-    metrics = results["metrics"]
+    metrics = evaluate_model(model, val_loader, device, criterion)
 
     print(
         metrics["accuracy"],

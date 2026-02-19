@@ -1,106 +1,26 @@
-# BASD: Bias-Aware Structural Distillation
+# BASD: Bias-Aware Structural Distillation for Vision Transformers
 
-Training mechanism for transferring representations from a frozen `DINOv2 ViT-S/14` teacher to a `DeiT-Tiny`-style student with structural distillation losses.
+Transfer teacher inductive biases beyond logits by jointly aligning feature content statistics (`D x D`), token-level relations (`B x K x D`), attention routing (`H x N x N`), and spatial frequency structure (2D FFT real+imaginary), implemented as one cohesive end-to-end BASD system where all components are optimized together; using a unified structural objective `L_ce + L_rsd + L_rel + L_attn + L_spectral`, adaptive spectral teacher-layer mixing at each student extraction point, learnable teacher-to-student token alignment via cross-attention projectors, learned attention head-space alignment via 1x1 convolution before attention KL, parameter-free analytical loss balancing (UW-SO style inverse-loss softmax) with staggered warmup ramps, and a dual-view training path (clean teacher view, strongly augmented student view) with MixUp/CutMix on the student branch.
 
-Standard KD with logits or a single feature loss under-utilizes the teacher when teacher/student token geometry and embedding spaces differ.
-
-The objective is to train a DeiT student using a unified multi-axis distillation objective that jointly aligns:
-- content statistics (`D x D`)
-- token structure (`N x N`)
-- attention routing (`H x N x N`)
-- frequency structure (2D spectrum)
-
-1. Orthogonal feature decomposition for distillation:
-   content + structure + routing + spectral constraints in one objective.
-2. Learnable teacher->student token alignment:
-   cross-attention projector instead of naive geometric resizing.
-3. Automatic loss balancing:
-   homoscedastic uncertainty weighting instead of manual lambdas.
-4. Staggered curriculum:
-   cosine warmup ramps per component with fixed offsets.
-
-## Setup
-
-```bash
-pip install -e .
-```
-
-## Training
-
-```bash
-# Single GPU
-torchrun --nproc_per_node=1 --module vit_inductive_bias_distillation.train configs/experiment/basd_imagenet.yaml
-
-# Multi-GPU
-torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/basd_imagenet.yaml
-```
-
-## Evaluation
-
-```bash
-python -m vit_inductive_bias_distillation.eval configs/experiment/basd_imagenet.yaml
-```
-
-## Ablations (LOCO)
-
-Leave-One-Component-Out ablation configs disable individual loss components:
-
-```bash
-torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_rsd.yaml
-torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_gram.yaml
-torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_attn.yaml
-torchrun --nproc_per_node=N --module vit_inductive_bias_distillation.train configs/experiment/ablation_no_spectral.yaml
-```
-
-## Integrated Mechanism
-
-Given student logits and intermediate tokens/attention from selected layers:
-```math
-\mathcal{L}_{total}
-=
-\mathcal{L}_{CE}
- + \mathcal{W}(
-r_{rsd}\mathcal{L}_{rsd},
-r_{gram}\mathcal{L}_{gram},
-r_{attn}\mathcal{L}_{attn},
-r_{spec}\mathcal{L}_{spec})
-```
-
-where `r_*` are warmup ramps and `W` is uncertainty weighting.
-
-### Teacher/Student Coupling
-- Teacher: frozen DINOv2 loaded from `torch.hub`
-- Student: DeiT with intermediate feature/attention extraction
-- Layer hooks extract teacher tokens and attention in one forward pass
-- Cross-attention projectors align teacher token count to student token count
-
-### Distillation Components
-- `L_rsd` (content): cross-correlation identity matching with off-diagonal suppression
-- `L_gram` (structure): token-token Gram matrix matching
-- `L_attn` (routing): KL divergence between teacher/student attention distributions
-- `L_spec` (spectral): radial-band FFT magnitude matching
-
-### Optimization
-- DDP (`nccl`) with `torchrun`
-- BF16 autocast
-- AdamW + linear warmup + cosine decay
-- SWA late-phase averaging
-- early stopping on validation loss
-- gradient clipping
+- Teacher: frozen `dinov2_vits14`, intermediate tokens + attentions extracted by hooks.
+- Student: custom DeiT-Tiny style ViT returning logits and selected-layer intermediates.
+- Alignment:
+  - Token alignment: per-layer cross-attention projector.
+  - Attention alignment: head aligner (1x1 conv) across stacked heads.
+- Loss orchestration:
+  - Adaptive spectral layer selector mixes teacher layers per extraction point.
+  - Four distillation losses are warmup-ramped and then weighted by analytical UW-SO.
+  - Final objective adds CE + weighted distillation + selector entropy regularization.
 
 ## References
 
-1. DeiT (ICML 2021): https://arxiv.org/abs/2012.12877
-   Student transformer design and distillation context (`vit_inductive_bias_distillation/models/deit.py`).
-2. DINOv2 (TMLR 2024): https://arxiv.org/abs/2304.07193
-   Pretrained teacher loaded/frozen in `vit_inductive_bias_distillation/models/teacher.py`.
-3. Barlow Twins (ICML 2021): https://arxiv.org/abs/2103.03230
-   Redundancy-reduction principle behind `L_rsd`.
-4. Redundancy Suppression Distillation: https://arxiv.org/abs/2507.21844
-   Token-level cross-correlation loss (`vit_inductive_bias_distillation/losses/rsd.py`).
-5. DINOv3: https://arxiv.org/abs/2508.10104
-   Structural Gram loss (`vit_inductive_bias_distillation/losses/gram.py`).
-6. SDKD Spectral Distillation: https://arxiv.org/abs/2507.02939
-   FFT band-matching loss (`vit_inductive_bias_distillation/losses/spectral.py`).
-7. Uncertainty Weighting (CVPR 2018): https://arxiv.org/abs/1705.07115
-   Adaptive multi-loss weighting (`vit_inductive_bias_distillation/losses/weighting.py`).
+1. Training data-efficient image transformers & distillation through attention, https://arxiv.org/abs/2012.12877  
+2. DINOv2: Learning Robust Visual Features without Supervision, https://arxiv.org/abs/2304.07193  
+3. Barlow Twins: Self-Supervised Learning via Redundancy Reduction, https://arxiv.org/abs/2103.03230  
+4. Cross-Architecture Distillation Made Simple with Redundancy Suppression, https://arxiv.org/abs/2507.21844  
+5. VRM: Knowledge Distillation via Virtual Relation Matching, https://arxiv.org/abs/2502.20760  
+6. SpectralKD: A Unified Framework for Interpreting and Distilling Vision Transformers via Spectral Analysis, https://arxiv.org/abs/2412.19055  
+7. Analytical Uncertainty-Based Loss Weighting in Multi-Task Learning, https://arxiv.org/abs/2408.07985  
+8. Align-to-Distill: Trainable Attention Alignment for Knowledge Distillation in Neural Machine Translation, https://arxiv.org/abs/2403.01479  
+9. ALP-KD: Attention-Based Layer Projection for Knowledge Distillation, https://arxiv.org/abs/2012.14022  
+10. Revisiting Intermediate-Layer Matching in Knowledge Distillation: Layer-Selection Strategy Doesn't Matter (Much), https://arxiv.org/abs/2502.04499 

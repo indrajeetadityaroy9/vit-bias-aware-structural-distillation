@@ -68,10 +68,10 @@ class Attention(nn.Module):
 
         if return_attention:
             scale = self.head_dim ** -0.5
-            attn = (q @ k.transpose(-2, -1)) * scale
-            attn = attn.softmax(dim=-1)
-            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-            return self.proj(x), attn.detach()
+            attn_logits = (q @ k.transpose(-2, -1)) * scale
+            attn_probs = attn_logits.softmax(dim=-1)
+            x = (attn_probs @ v).transpose(1, 2).reshape(B, N, C)
+            return self.proj(x), attn_logits
 
         x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, N, C)
@@ -164,28 +164,27 @@ class DeiT(nn.Module):
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         return x + self.pos_embed
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, layer_indices: list[int] | None = None
+    ) -> torch.Tensor | StudentIntermediates:
+        """Forward pass. Returns logits when layer_indices is None, or
+        StudentIntermediates with per-layer tokens and attention when provided."""
         x = self._embed(x)
 
-        if self.training:
-            for block in self.blocks:
-                x = checkpoint(block, x, use_reentrant=False)
-        else:
-            for block in self.blocks:
-                x = block(x)
+        if layer_indices is None:
+            if self.training:
+                for block in self.blocks:
+                    x = checkpoint(block, x, use_reentrant=False)
+            else:
+                for block in self.blocks:
+                    x = block(x)
 
-        x = self.norm(x)
-        return self.head(x[:, 0])
+            x = self.norm(x)
+            return self.head(x[:, 0])
 
-    def forward_with_intermediates(
-        self, x: torch.Tensor, layer_indices: list[int]
-    ) -> StudentIntermediates:
-        """Forward pass with per-layer tokens and attention for BASD losses."""
         layer_set = set(layer_indices)
         intermediates: dict[int, torch.Tensor] = {}
         attention_weights: dict[int, torch.Tensor] = {}
-
-        x = self._embed(x)
 
         for idx, block in enumerate(self.blocks):
             if idx in layer_set:

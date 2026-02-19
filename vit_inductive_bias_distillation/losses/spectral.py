@@ -1,4 +1,4 @@
-"""2D spectral feature matching with learnable radial band weights."""
+"""Phase-preserving 2D spectral feature matching (SpectralKD)."""
 
 from __future__ import annotations
 
@@ -10,66 +10,51 @@ __all__ = ["SpectralMatchingLoss"]
 
 
 class SpectralMatchingLoss(nn.Module):
-    """Match student and teacher FFT magnitudes across radial bands."""
+    """Match student and teacher frequency representations via rfft2.
 
-    def __init__(self, num_bands: int = 4):
-        """Initialize band weights and mask cache."""
-        super().__init__()
-        self.num_bands = num_bands
-        self.band_weights = nn.Parameter(torch.ones(num_bands))
-        self._band_cache: dict[tuple[int, int], list[torch.Tensor]] = {}
+    Uses real+imaginary component matching instead of magnitude-only,
+    preserving phase information (SpectralKD, arXiv 2412.19055).
+    Parameter-free: no learnable weights.
+    """
 
     def _to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Reshape tokens to a square grid for 2D FFT."""
+        """Reshape (B, N, D) tokens to (B, D, H, W) spatial grid."""
         B, N, D = tokens.shape
-        # BASD uses square patch grids, so N must be H*W with H=W.
         H = W = int(N ** 0.5)
         return tokens.permute(0, 2, 1).reshape(B, D, H, W)
-
-    def _get_radial_bands(
-        self, H: int, W: int, device: torch.device
-    ) -> list[torch.Tensor]:
-        """Return cached radial frequency band masks."""
-        key = (H, W)
-        if key not in self._band_cache:
-            cy, cx = H // 2, W // 2
-            y = torch.arange(H, dtype=torch.float32) - cy
-            x = torch.arange(W, dtype=torch.float32) - cx
-            radius = torch.sqrt(y[:, None] ** 2 + x[None, :] ** 2)
-            max_r = radius.max()
-
-            bands = []
-            for k in range(self.num_bands):
-                lo = max_r * k / self.num_bands
-                hi = max_r * (k + 1) / self.num_bands
-                mask = ((radius >= lo) & (radius < hi)).unsqueeze(0).unsqueeze(0)
-                bands.append(mask.float())
-
-            self._band_cache[key] = bands
-
-        return [b.to(device) for b in self._band_cache[key]]
 
     def forward(
         self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
     ) -> torch.Tensor:
-        """Compute weighted spectral MSE over radial bands."""
+        """Compute MSE on stacked real+imag rfft2 components."""
         s_2d = self._to_spatial(student_tokens)
         t_2d = self._to_spatial(teacher_tokens)
 
-        s_freq = torch.fft.fftshift(torch.fft.fft2(s_2d))
-        t_freq = torch.fft.fftshift(torch.fft.fft2(t_2d))
+        # Half-spectrum FFT with orthonormal normalization
+        s_freq = torch.fft.rfft2(s_2d, norm="ortho")
+        t_freq = torch.fft.rfft2(t_2d, norm="ortho")
 
-        s_mag = s_freq.abs().mean(dim=1)
-        t_mag = t_freq.abs().mean(dim=1)
+        # Stack real and imaginary: (B, D, H, W//2+1) complex -> (B, 2, D, H, W//2+1)
+        s_ri = torch.stack([s_freq.real, s_freq.imag], dim=1)
+        t_ri = torch.stack([t_freq.real, t_freq.imag], dim=1)
 
-        _, H, W = s_mag.shape
-        bands = self._get_radial_bands(H, W, s_mag.device)
-        weights = F.softplus(self.band_weights)
+        # Align channel dimensions if D_s != D_t
+        D_s = s_ri.shape[2]
+        D_t = t_ri.shape[2]
+        if D_s != D_t:
+            target_d = min(D_s, D_t)
+            # adaptive_avg_pool1d pools the LAST dimension, so we need D last.
+            # Input: (B, 2, D, H, W_half) -> merge batch+spatial -> (B*2*H*W_half, D)
+            # -> unsqueeze for pool1d -> (B*2*H*W_half, 1, D) -> pool -> reshape back
+            B, two, _, H, W_half = s_ri.shape
+            if D_s > target_d:
+                # (B, 2, D_s, H, W_half) -> (B, 2, H, W_half, D_s) -> flatten -> pool -> reshape
+                s_flat = s_ri.permute(0, 1, 3, 4, 2).reshape(-1, 1, D_s)
+                s_flat = F.adaptive_avg_pool1d(s_flat, target_d)
+                s_ri = s_flat.reshape(B, two, H, W_half, target_d).permute(0, 1, 4, 2, 3)
+            if D_t > target_d:
+                t_flat = t_ri.permute(0, 1, 3, 4, 2).reshape(-1, 1, D_t)
+                t_flat = F.adaptive_avg_pool1d(t_flat, target_d)
+                t_ri = t_flat.reshape(B, two, H, W_half, target_d).permute(0, 1, 4, 2, 3)
 
-        loss = torch.tensor(0.0, device=student_tokens.device)
-        for k, mask in enumerate(bands):
-            m = mask.squeeze(1)
-            band_loss = F.mse_loss(s_mag * m, t_mag * m)
-            loss = loss + weights[k] * band_loss
-
-        return loss / self.num_bands
+        return F.mse_loss(s_ri, t_ri)

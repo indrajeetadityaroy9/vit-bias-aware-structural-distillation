@@ -12,7 +12,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from vit_inductive_bias_distillation.config import load_config, save_config
 from vit_inductive_bias_distillation.data import create_dataloaders
 from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
-from vit_inductive_bias_distillation.models import build_student_model, load_teacher
+from vit_inductive_bias_distillation.models.deit import DeiT
+from vit_inductive_bias_distillation.models.teacher import load_teacher
 from vit_inductive_bias_distillation.training import BASDTrainer, init_distributed, seed_everything
 
 def main() -> None:
@@ -31,14 +32,14 @@ def main() -> None:
 
     dist.barrier()
 
-    student = build_student_model(config, device)
+    student = DeiT(config.vit, config.model).to(device)
     student = DDP(student, device_ids=[device.index])
     student = torch.compile(student, mode="max-autotune")
 
     teacher = load_teacher(config.basd.teacher_model_name, device)
 
-    train_loader, train_sampler, val_loader, test_loader = create_dataloaders(
-        config, world_size, rank, True
+    train_loader, train_sampler, val_loader = create_dataloaders(
+        config, world_size, rank
     )
 
     total_steps = len(train_loader) * config.training.num_epochs
@@ -56,8 +57,7 @@ def main() -> None:
     trainer.train_ddp(train_loader, train_sampler, val_loader, start_epoch=start_epoch)
 
     if rank == 0:
-        results = evaluate_model(trainer.ddp_model.module, test_loader, device, trainer.criterion)
-        metrics = results["metrics"]
+        metrics = evaluate_model(trainer.ddp_model.module, val_loader, device, trainer.criterion)
         print(
             metrics["accuracy"],
             metrics["precision_macro"],

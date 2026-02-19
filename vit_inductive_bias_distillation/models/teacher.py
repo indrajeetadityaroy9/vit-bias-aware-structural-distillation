@@ -28,6 +28,7 @@ class TeacherIntermediates(NamedTuple):
     projected: dict[int, torch.Tensor]
     raw: dict[int, torch.Tensor]
     attentions: dict[int, torch.Tensor]
+    all_raw: dict[int, torch.Tensor]
 
 
 def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
@@ -51,26 +52,38 @@ def extract_intermediates(
     token_layers: list[int],
     attn_layers: list[int],
     projectors: torch.nn.ModuleList,
+    all_token_layers: list[int] | None = None,
 ) -> TeacherIntermediates:
-    """Extract intermediate tokens and attention maps in one teacher pass."""
+    """Extract intermediate tokens and attention maps in one teacher pass.
+
+    Args:
+        teacher_model: Frozen DINOv2 teacher.
+        x: Input images (B, C, H, W).
+        token_layers: Layer indices for projection (paired with projectors).
+        attn_layers: Layer indices for attention extraction.
+        projectors: Cross-attention projectors (one per token_layer).
+        all_token_layers: Additional layers to extract raw tokens from
+            (for adaptive layer selection). When provided, raw tokens are
+            captured from all specified layers and returned in ``all_raw``.
+    """
     hooks: list[torch.utils.hooks.RemovableHook] = []
     captured_tokens: dict[int, torch.Tensor] = {}
     captured_attns: dict[int, torch.Tensor] = {}
-    all_token_layers = set(token_layers)
-    all_attn_layers = set(attn_layers)
-    all_layers = all_token_layers | all_attn_layers
+    extract_token_layers = set(token_layers) | set(all_token_layers or [])
+    extract_attn_layers = set(attn_layers)
+    all_layers = extract_token_layers | extract_attn_layers
 
     for layer_idx in all_layers:
         block = teacher_model.blocks[layer_idx]
 
-        if layer_idx in all_token_layers:
+        if layer_idx in extract_token_layers:
             def make_token_hook(idx: int):
                 def hook(module, input, output):
                     captured_tokens[idx] = output[:, 1:, :]
                 return hook
             hooks.append(block.register_forward_hook(make_token_hook(layer_idx)))
 
-        if layer_idx in all_attn_layers:
+        if layer_idx in extract_attn_layers:
             def make_attn_hook(idx: int):
                 def hook(module, input, output):
                     batch_size, num_tokens, channels = input[0].shape
@@ -97,8 +110,15 @@ def extract_intermediates(
         raw_intermediates[layer_idx] = captured_tokens[layer_idx]
         intermediates[layer_idx] = projectors[i](captured_tokens[layer_idx])
 
+    # All raw tokens for adaptive layer selection
+    all_raw: dict[int, torch.Tensor] = {
+        idx: captured_tokens[idx]
+        for idx in sorted(captured_tokens)
+    }
+
     return TeacherIntermediates(
         projected=intermediates,
         raw=raw_intermediates,
         attentions=captured_attns,
+        all_raw=all_raw,
     )

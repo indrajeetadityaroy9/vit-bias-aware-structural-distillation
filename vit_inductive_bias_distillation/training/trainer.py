@@ -19,6 +19,8 @@ from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel, SWALR
 
+from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
+
 from vit_inductive_bias_distillation.config import BASDExperimentConfig
 from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
 from vit_inductive_bias_distillation.losses.combined import BASDLoss
@@ -146,6 +148,8 @@ class BASDTrainer:
             config=config.basd,
             total_steps=total_steps,
             disable_components=config.basd.disable_components,
+            student_num_heads=config.vit.num_heads,
+            teacher_num_heads=config.basd.cross_attn_num_heads,
         ).to(device)
 
         self.optimizer.add_param_group({
@@ -155,6 +159,12 @@ class BASDTrainer:
 
         self.attn_layer_pairs = [tuple(p) for p in config.basd.attn_layer_pairs]
         self.teacher_attn_layers = sorted({p[1] for p in self.attn_layer_pairs})
+        self.all_teacher_token_layers = list(range(config.basd.num_teacher_layers))
+
+        self.mixup_cutmix = RandomChoice([
+            MixUp(alpha=0.8, num_classes=config.model.num_classes),
+            CutMix(alpha=1.0, num_classes=config.model.num_classes),
+        ])
 
         if self.is_main_process:
             print(
@@ -240,7 +250,7 @@ class BASDTrainer:
         total_loss = 0.0
         total_ce_loss = 0.0
         total_rsd_loss = 0.0
-        total_gram_loss = 0.0
+        total_rel_loss = 0.0
         total_attn_loss = 0.0
         total_spectral_loss = 0.0
         correct = 0
@@ -252,8 +262,11 @@ class BASDTrainer:
             student_imgs = student_imgs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
+            # Mixup/CutMix on student images only (teacher uses clean images)
+            student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
+
             with autocast(device_type="cuda", dtype=self._autocast_dtype):
-                student_results = self.ddp_model.module.forward_with_intermediates(
+                student_results = self.ddp_model(
                     student_imgs,
                     layer_indices=self.token_layers,
                 )
@@ -267,15 +280,18 @@ class BASDTrainer:
                     self.token_layers,
                     self.teacher_attn_layers,
                     self.cross_attn_projectors,
+                    all_token_layers=self.all_teacher_token_layers,
                 )
                 loss, loss_dict = self.basd_loss(
                     student_output,
-                    targets,
+                    mixed_targets,
                     student_intermediates,
                     teacher_results.projected,
                     teacher_results.raw,
+                    teacher_results.all_raw,
                     student_attns,
                     teacher_results.attentions,
+                    self.cross_attn_projectors,
                     self.global_step,
                 )
 
@@ -292,7 +308,7 @@ class BASDTrainer:
             total_loss += loss.item()
             total_ce_loss += loss_dict["ce_loss"]
             total_rsd_loss += loss_dict["rsd_loss"]
-            total_gram_loss += loss_dict["gram_loss"]
+            total_rel_loss += loss_dict["rel_loss"]
             total_attn_loss += loss_dict["attn_loss"]
             total_spectral_loss += loss_dict["spectral_loss"]
 
@@ -307,7 +323,7 @@ class BASDTrainer:
             total_loss,
             total_ce_loss,
             total_rsd_loss,
-            total_gram_loss,
+            total_rel_loss,
             total_attn_loss,
             total_spectral_loss,
             correct,
@@ -321,14 +337,14 @@ class BASDTrainer:
             "train_loss": metrics_tensor[0].item() / batch_count_total,
             "train_ce_loss": metrics_tensor[1].item() / batch_count_total,
             "train_rsd_loss": metrics_tensor[2].item() / batch_count_total,
-            "train_gram_loss": metrics_tensor[3].item() / batch_count_total,
+            "train_rel_loss": metrics_tensor[3].item() / batch_count_total,
             "train_attn_loss": metrics_tensor[4].item() / batch_count_total,
             "train_spectral_loss": metrics_tensor[5].item() / batch_count_total,
             "train_acc": 100.0 * metrics_tensor[6].item() / metrics_tensor[7].item(),
             "total_samples": int(metrics_tensor[7].item()),
         }
         for key in loss_dict:
-            if key.startswith(("sigma_", "weight_")):
+            if key.startswith("weight_"):
                 result[key] = loss_dict[key]
         return result
 
@@ -351,12 +367,11 @@ class BASDTrainer:
 
             train_metrics = self.train_epoch_ddp(train_loader, train_sampler)
 
-            val_results = evaluate_model(
+            val_metrics = evaluate_model(
                 self.ddp_model, val_loader, self.device,
                 criterion=self.criterion,
                 rank=self.rank, world_size=self.world_size,
             )
-            val_metrics = val_results["metrics"]
 
             self.step_scheduler(epoch)
 
@@ -373,7 +388,7 @@ class BASDTrainer:
                     train_metrics["train_loss"],
                     train_metrics["train_ce_loss"],
                     train_metrics["train_rsd_loss"],
-                    train_metrics["train_gram_loss"],
+                    train_metrics["train_rel_loss"],
                     train_metrics["train_attn_loss"],
                     train_metrics["train_spectral_loss"],
                     train_metrics["train_acc"],

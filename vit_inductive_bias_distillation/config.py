@@ -11,18 +11,9 @@ import yaml
 
 
 @dataclass(frozen=True)
-class AugmentationConfig:
-    random_crop: bool = True
-    random_flip: bool = True
-    trivial_augment: bool = True
-    cutout: bool = True
-
-
-@dataclass(frozen=True)
 class DataConfig:
     batch_size: int = 256
     num_workers: int = 16
-    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
 
 @dataclass(frozen=True)
@@ -63,12 +54,16 @@ class BASDConfig:
     token_layers: list[int] = field(default_factory=lambda: [3, 6, 9, 11])
     warmup_fraction: float = 0.1
     disable_components: list[str] | None = None
+    uwso_temperature: float = 2.0
+    vrm_num_pairs: int = 128
+    num_teacher_layers: int = 12
+    layer_selector_temperature: float = 2.0
+    layer_selector_entropy_weight: float = 0.01
     # Derived fields are computed in load_config().
     teacher_embed_dim: int = 0
     cross_attn_num_heads: int = 0
     rsd_kappa: float = 0.0
     attn_layer_pairs: list[tuple[int, int]] = field(default_factory=list)
-    spectral_num_bands: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,7 +120,6 @@ def load_config(config_path: str | Path) -> BASDExperimentConfig:
         cross_attn_num_heads=max(1, teacher_dim // 64),
         rsd_kappa=1.0 / teacher_dim,
         attn_layer_pairs=[(layer, layer) for layer in config.basd.token_layers],
-        spectral_num_bands=config.vit.img_size // config.vit.patch_size,
     )
     return dataclasses.replace(config, basd=new_basd)
 
