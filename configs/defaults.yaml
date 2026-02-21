@@ -43,7 +43,6 @@ basd:
   teacher_model_name: dinov2_vits14
   token_layers: [3, 6, 9, 11]
   warmup_fraction: 0.1
-  disable_components: []
   warmup_stagger:
     rsd: 0.0
     rel: 0.25
@@ -51,6 +50,10 @@ basd:
     spectral: 0.5
   uwso_temperature: 2.0
   vrm_num_pairs: 128
+  rel_num_triplets: 64
+  rel_angle_weight: 0.5
+  bw_diagonal: true
+  bw_mean_weight: 1.0
   layer_selector_temperature: 2.0
   layer_selector_diversity_weight: 0.01
   layer_selector_recon_weight: 0.01

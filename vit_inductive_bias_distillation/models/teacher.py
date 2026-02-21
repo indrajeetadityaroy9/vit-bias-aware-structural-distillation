@@ -5,8 +5,6 @@ from typing import NamedTuple
 import timm
 import torch
 
-from vit_inductive_bias_distillation.runtime_log import log_event
-
 __all__ = [
     "load_teacher",
     "extract_intermediates",
@@ -27,15 +25,6 @@ class TeacherModel(NamedTuple):
 class TeacherIntermediates(NamedTuple):
     all_tokens: dict[int, torch.Tensor]
     all_attentions: dict[int, torch.Tensor]
-
-
-def _detect_feature_format(model: torch.nn.Module, device: torch.device) -> str:
-    probe = torch.zeros(1, 3, 224, 224, device=device)
-    features = model.forward_features(probe)
-    if features.dim() == 3:
-        return "token"
-    # For pretrained CNNs, channel width is larger than spatial dimensions.
-    return "nchw" if features.shape[1] > features.shape[3] else "nhwc"
 
 
 def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
@@ -61,16 +50,19 @@ def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
         embed_dim = model.num_features
         num_layers = 1
         num_heads = max(1, embed_dim // 64)
-        feature_format = _detect_feature_format(model, device)
+        probe = torch.zeros(1, 3, 224, 224, device=device)
+        features = model.forward_features(probe)
+        if features.dim() == 3:
+            feature_format = "token"
+        elif features.shape[1] > features.shape[3]:
+            feature_format = "nchw"
+        else:
+            feature_format = "nhwc"
         loader = "timm"
 
-    log_event(
-        "teacher_loaded",
-        model=model_name,
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        feature_format=feature_format,
+    print(
+        f"event=teacher_loaded model={model_name} embed_dim={embed_dim} "
+        f"num_layers={num_layers} num_heads={num_heads} feature_format={feature_format}"
     )
     return TeacherModel(
         model=model,
@@ -80,19 +72,6 @@ def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
         loader=loader,
         feature_format=feature_format,
     )
-
-
-def _extract_cnn(
-    teacher_model: torch.nn.Module,
-    x: torch.Tensor,
-    feature_format: str,
-) -> TeacherIntermediates:
-    features = teacher_model.forward_features(x)
-    if feature_format == "nhwc":
-        features = features.permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
-    else:
-        features = features.flatten(2).transpose(1, 2)
-    return TeacherIntermediates(all_tokens={0: features}, all_attentions={})
 
 
 def _extract_vit(
@@ -147,4 +126,9 @@ def extract_intermediates(
 ) -> TeacherIntermediates:
     if loader == "dinov2":
         return _extract_vit(teacher_model, x, num_layers)
-    return _extract_cnn(teacher_model, x, feature_format)
+    features = teacher_model.forward_features(x)
+    if feature_format == "nhwc":
+        features = features.permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
+    else:
+        features = features.flatten(2).transpose(1, 2)
+    return TeacherIntermediates(all_tokens={0: features}, all_attentions={})

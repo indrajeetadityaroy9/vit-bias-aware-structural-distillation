@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from typing import Final
 
 import torch
 import torch.nn as nn
@@ -9,20 +8,7 @@ import torch.nn.functional as F
 
 __all__ = ["AttentionDistillationLoss"]
 
-_ATTN_EPS: Final[float] = 1e-8
-
-
-class HeadAligner(nn.Module):
-    def __init__(self, total_student_heads: int, total_teacher_heads: int):
-        super().__init__()
-        self.conv = nn.Conv2d(
-            total_student_heads, total_teacher_heads,
-            kernel_size=1, bias=False,
-        )
-        nn.init.kaiming_normal_(self.conv.weight, mode="fan_out", nonlinearity="linear")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+_ATTN_EPS: float = 1e-8
 
 
 class AttentionDistillationLoss(nn.Module):
@@ -41,7 +27,11 @@ class AttentionDistillationLoss(nn.Module):
         total_student_heads = student_heads_per_layer * num_layers
         total_teacher_heads = teacher_heads_per_layer * num_layers
 
-        self.head_aligner = HeadAligner(total_student_heads, total_teacher_heads)
+        self.head_aligner = nn.Conv2d(
+            total_student_heads, total_teacher_heads,
+            kernel_size=1, bias=False,
+        )
+        nn.init.kaiming_normal_(self.head_aligner.weight, mode="fan_out", nonlinearity="linear")
         self._raw_temperature = nn.Parameter(
             torch.tensor(math.log(math.exp(init_temperature) - 1.0))
         )
@@ -60,7 +50,6 @@ class AttentionDistillationLoss(nn.Module):
             mode="bilinear", align_corners=False,
         )
         attn_resized = attn_resized.reshape(B, H, target_size, target_size)
-        # Keep row-wise probabilities normalized after interpolation.
         return attn_resized / (attn_resized.sum(dim=-1, keepdim=True) + _ATTN_EPS)
 
     def forward(

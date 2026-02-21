@@ -9,6 +9,12 @@ import torch.nn.functional as F
 __all__ = ["GrassmannianLayerSelector"]
 
 
+def _polar_retraction(W: torch.Tensor) -> torch.Tensor:
+    # Project W to the nearest orthonormal matrix via thin-SVD polar factor.
+    U, _, Vt = torch.linalg.svd(W, full_matrices=False)
+    return U @ Vt
+
+
 def _grassmann_subspace(
     z_flat: torch.Tensor,
     k: int,
@@ -58,6 +64,12 @@ class GrassmannianLayerSelector(nn.Module):
             )
         )
 
+    @torch.no_grad()
+    def project_to_stiefel(self) -> None:
+        # Retract projection weights to the Stiefel manifold after optimizer steps.
+        self.phi_s.weight.copy_(_polar_retraction(self.phi_s.weight))
+        self.phi_t.weight.copy_(_polar_retraction(self.phi_t.weight))
+
     @property
     def temperatures(self) -> torch.Tensor:
         return F.softplus(self.log_temperatures)
@@ -85,7 +97,7 @@ class GrassmannianLayerSelector(nn.Module):
             t_flat = all_teacher_tokens[idx].reshape(-1, D_t)
             z_teachers[idx] = self.phi_t(t_flat)
 
-        # Eigenspace extraction is detached; gradients flow through reconstruction terms.
+        # Keep eigendecomposition detached; projection gradients come from reconstruction terms.
         teacher_subspaces: dict[int, torch.Tensor] = {}
         with torch.no_grad():
             for idx in teacher_indices:
@@ -148,7 +160,7 @@ class GrassmannianLayerSelector(nn.Module):
                     orth_i = orth_i + weights[a] * weights[b] * cross_gram[a, b]
             total_orth = total_orth + orth_i
 
-            # Detaching weights keeps phi_t gradients independent from temperature dynamics.
+            # Detach weights so phi_t gradients are not coupled to temperature updates.
             z_t_mean = torch.stack([
                 z_teachers[idx].mean(dim=0) for idx in teacher_indices
             ])

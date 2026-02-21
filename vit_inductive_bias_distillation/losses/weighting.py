@@ -9,16 +9,23 @@ __all__ = ["UncertaintyWeighting", "WarmupSchedule"]
 
 
 class UncertaintyWeighting:
-    def __init__(self, component_names: list[str], temperature: float = 2.0):
+    # Compute inverse-loss softmax weights over active loss components.
+
+    def __init__(
+        self,
+        component_names: list[str],
+        temperature: float = 2.0,
+    ):
         self.component_names = list(component_names)
         self.temperature = temperature
 
     def forward(
-        self, losses: dict[str, torch.Tensor]
+        self,
+        losses: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
         info: dict[str, float] = {}
 
-        # Zero-ramped losses are excluded to avoid unstable inverse weighting.
+        # Skip inactive components to avoid unstable inverse-loss scaling.
         active = {k: v for k, v in losses.items() if v.item() > 1e-8}
 
         if not active:
@@ -32,7 +39,6 @@ class UncertaintyWeighting:
         )
         omega = F.softmax(raw_w / self.temperature, dim=0)
 
-        # Scale by active count to preserve loss magnitude after softmax normalization.
         n_active = len(active)
         total = torch.zeros((), device=raw_w.device, dtype=raw_w.dtype)
         for i, (name, loss) in enumerate(active.items()):

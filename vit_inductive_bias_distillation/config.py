@@ -18,10 +18,6 @@ class Config:
             else:
                 setattr(self, key, value)
 
-    def __repr__(self) -> str:
-        items = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
-        return f"Config({items})"
-
 
 def _to_dict(obj: Any) -> Any:
     if isinstance(obj, Config):
@@ -47,8 +43,6 @@ def load_config(config_path: str | Path) -> Config:
 
     with open(config_path) as f:
         overrides = yaml.safe_load(f)
-        if not isinstance(overrides, dict):
-            raise ValueError(f"Config file must contain a YAML mapping, got {type(overrides)}")
 
     presets = defaults.pop("presets")
 
@@ -56,16 +50,7 @@ def load_config(config_path: str | Path) -> Config:
 
     preset_name = merged["model"]["student_preset"]
     if preset_name:
-        if preset_name not in presets:
-            raise ValueError(
-                f"Unknown student preset: {preset_name}. "
-                f"Available: {list(presets)}"
-            )
         merged["model"]["vit"].update(presets[preset_name])
-
-    vit = merged["model"]["vit"]
-    if vit["img_size"] % vit["patch_size"] != 0:
-        raise ValueError("img_size must be divisible by patch_size")
 
     dataset_info = get_dataset_info(merged["data"]["dataset"])
     merged["model"]["num_classes"] = dataset_info["num_classes"]

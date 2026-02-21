@@ -16,7 +16,6 @@ from vit_inductive_bias_distillation.data.datasets import (
 )
 from vit_inductive_bias_distillation.data.transforms import build_eval_transform
 from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model, measure_efficiency
-from vit_inductive_bias_distillation.runtime_log import log_event
 
 
 def run_eval_suite(
@@ -45,36 +44,35 @@ def run_eval_suite(
             pin_memory=True,
         )
 
-        valid_indices = None
-        if "parent_dataset" in info:
-            valid_indices = get_subset_indices(ds_name)
+        valid_indices = get_subset_indices(ds_name) if "parent_dataset" in info else None
+        num_classes = len(valid_indices) if valid_indices else info["num_classes"]
 
-        metrics = evaluate_model(model, loader, device, criterion, valid_indices=valid_indices)
+        metrics = evaluate_model(
+            model, loader, device, criterion,
+            num_classes=num_classes, valid_indices=valid_indices,
+        )
 
         if ds_name == config.data.dataset:
             primary_results = metrics
         else:
             robustness_results[ds_name] = metrics
 
-        log_event(
-            "eval_dataset",
-            dataset=ds_name,
-            top1=metrics["val_acc"],
-            top5=metrics["val_acc_top5"],
-            loss=metrics["loss"],
+        print(
+            f"event=eval_dataset dataset={ds_name} "
+            f"top1={metrics['val_acc']:.2f} top5={metrics['val_acc_top5']:.2f} "
+            f"loss={metrics['loss']:.4f}"
         )
 
     efficiency = measure_efficiency(
         model, device,
         image_size=config.model.vit.img_size,
+        in_channels=config.model.in_channels,
     )
 
-    log_event(
-        "eval_efficiency",
-        dataset=config.data.dataset,
-        params_m=efficiency["param_count_m"],
-        gflops=efficiency["gflops"],
-        throughput_img_per_sec=efficiency["throughput_img_per_sec"],
+    print(
+        f"event=eval_efficiency dataset={config.data.dataset} "
+        f"params_m={efficiency['param_count_m']:.2f} gflops={efficiency['gflops']:.2f} "
+        f"throughput_img_per_sec={efficiency['throughput_img_per_sec']:.0f}"
     )
 
     return {

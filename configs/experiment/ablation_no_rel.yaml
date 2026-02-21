@@ -1,8 +1,0 @@
-run:
-  name: ablation_no_rel
-
-data:
-  dataset: imagenet1k
-
-basd:
-  disable_components: [rel]
