@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -9,8 +9,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from vit_inductive_bias_distillation.config import Config
-
-__all__ = ["DeiT", "StudentIntermediates"]
 
 
 class StudentIntermediates(NamedTuple):
@@ -20,7 +18,7 @@ class StudentIntermediates(NamedTuple):
 
 
 class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
+    def __init__(self, *, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
 
@@ -52,13 +50,16 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
 
     def forward(
-        self, x: torch.Tensor, return_attention: bool = False
+        self,
+        x: torch.Tensor,
+        *,
+        output_mode: Literal["features_only", "with_attention"] = "features_only",
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        if return_attention:
+        if output_mode == "with_attention":
             scale = self.head_dim ** -0.5
             attn_logits = (q @ k.transpose(-2, -1)) * scale
             attn_probs = attn_logits.softmax(dim=-1)
@@ -82,11 +83,11 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, *, mlp_ratio: float = 4.0, drop_path: float = 0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads)
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio))
 
@@ -106,7 +107,7 @@ class DeiT(nn.Module):
 
         self.patch_embed = PatchEmbed(
             vit_config.img_size, vit_config.patch_size,
-            model_config.in_channels, vit_config.embed_dim,
+            3, vit_config.embed_dim,
         )
         num_patches = self.patch_embed.num_patches
 
@@ -115,16 +116,13 @@ class DeiT(nn.Module):
 
         dpr = torch.linspace(0, vit_config.drop_path_rate, vit_config.depth).tolist()
         self.blocks = nn.ModuleList([
-            Block(vit_config.embed_dim, vit_config.num_heads, 4.0, dpr[i])
+            Block(vit_config.embed_dim, vit_config.num_heads, mlp_ratio=4.0, drop_path=dpr[i])
             for i in range(vit_config.depth)
         ])
 
         self.norm = nn.LayerNorm(vit_config.embed_dim)
         self.head = nn.Linear(vit_config.embed_dim, model_config.num_classes)
 
-        self._init_weights()
-
-    def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_module)
@@ -143,16 +141,13 @@ class DeiT(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, layer_indices: list[int] = ()
+    ) -> StudentIntermediates:
         B = x.shape[0]
         x = self.patch_embed(x)
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
-        return x + self.pos_embed
-
-    def forward(
-        self, x: torch.Tensor, layer_indices: list[int] = ()
-    ) -> StudentIntermediates:
-        x = self._embed(x)
+        x = x + self.pos_embed
 
         layer_set = set(layer_indices)
         intermediates: dict[int, torch.Tensor] = {}
@@ -161,7 +156,7 @@ class DeiT(nn.Module):
         for idx, block in enumerate(self.blocks):
             if idx in layer_set:
                 normed = block.norm1(x)
-                attn_out, attn_w = block.attn(normed, return_attention=True)
+                attn_out, attn_w = block.attn(normed, output_mode="with_attention")
                 attention_weights[idx] = attn_w
                 x = x + block.drop_path(attn_out)
                 x = x + block.drop_path(block.mlp(block.norm2(x)))

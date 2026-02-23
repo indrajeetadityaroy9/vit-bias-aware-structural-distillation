@@ -6,10 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["AttentionDistillationLoss"]
-
-_ATTN_EPS: float = 1e-8
-
 
 class AttentionDistillationLoss(nn.Module):
     def __init__(
@@ -17,6 +13,7 @@ class AttentionDistillationLoss(nn.Module):
         student_heads_per_layer: int,
         teacher_heads_per_layer: int,
         num_layers: int,
+        *,
         init_temperature: float = 1.0,
     ):
         super().__init__()
@@ -50,7 +47,7 @@ class AttentionDistillationLoss(nn.Module):
             mode="bilinear", align_corners=False,
         )
         attn_resized = attn_resized.reshape(B, H, target_size, target_size)
-        return attn_resized / (attn_resized.sum(dim=-1, keepdim=True) + _ATTN_EPS)
+        return attn_resized / (attn_resized.sum(dim=-1, keepdim=True) + 1e-8)
 
     def forward(
         self,

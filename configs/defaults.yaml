@@ -4,14 +4,13 @@ run:
   seed: 42
 
 data:
-  dataset: imagenet1k
+  dataset: ILSVRC/imagenet-1k
   eval_datasets: []
   batch_size: 256
   num_workers: 16
 
 model:
   student_preset: ""
-  in_channels: 3
   num_classes: 0
   vit:
     img_size: 224
@@ -26,6 +25,7 @@ checkpoint:
   path: null
 
 training:
+  mode: distill
   num_epochs: 300
   learning_rate: 1.0e-3
   weight_decay: 0.05
@@ -40,26 +40,18 @@ training:
   autocast_dtype: bfloat16
 
 basd:
-  teacher_model_name: dinov2_vits14
-  token_layers: [3, 6, 9, 11]
-  warmup_fraction: 0.1
-  warmup_stagger:
-    rsd: 0.0
-    rel: 0.25
-    attn: 0.25
-    spectral: 0.5
-  uwso_temperature: 2.0
-  vrm_num_pairs: 128
-  rel_num_triplets: 64
-  rel_angle_weight: 0.5
-  bw_diagonal: true
-  bw_mean_weight: 1.0
+  teacher_model_name: dinov3_vitb16
+  teacher_loader: dinov3
+  num_extraction_points: 4
+  rel_attn_weighted: weighted
+  grad_gate_window: 100
   layer_selector_temperature: 2.0
-  layer_selector_diversity_weight: 0.01
-  layer_selector_recon_weight: 0.01
-  layer_selector_grass_proj_dim: 128
-  layer_selector_grass_rank: 16
   layer_selector_grass_cov_eps: 1.0e-4
+  disabled_components: []
+  use_scale_invariant_weighting: true
+  use_gradient_gating: true
+  use_lagrangian_reg: true
+  layer_selector_fixed_rank: 0
 
 presets:
   deit_tiny:

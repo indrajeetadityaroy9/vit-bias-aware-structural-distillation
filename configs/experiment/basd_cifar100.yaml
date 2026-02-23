@@ -2,7 +2,7 @@ run:
   name: basd_cifar100
 
 data:
-  dataset: cifar100
+  dataset: uoft-cs/cifar100
   batch_size: 128
 
 model:
@@ -14,4 +14,3 @@ model:
 training:
   num_epochs: 200
   learning_rate: 5e-4
-  weight_decay: 0.05

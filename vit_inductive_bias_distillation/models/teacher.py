@@ -4,15 +4,6 @@ from typing import NamedTuple
 
 import timm
 import torch
-
-__all__ = [
-    "load_teacher",
-    "extract_intermediates",
-    "TeacherModel",
-    "TeacherIntermediates",
-]
-
-
 class TeacherModel(NamedTuple):
     model: torch.nn.Module
     embed_dim: int
@@ -27,26 +18,15 @@ class TeacherIntermediates(NamedTuple):
     all_attentions: dict[int, torch.Tensor]
 
 
-def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
-    is_dinov2 = model_name.startswith("dinov2_")
-
-    if is_dinov2:
-        model = torch.hub.load("facebookresearch/dinov2", model_name)
-    else:
-        model = timm.create_model(model_name, pretrained=True, num_classes=0)
-
-    model = model.to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
-    if is_dinov2:
+def load_teacher(model_name: str, device: torch.device, loader: str) -> TeacherModel:
+    if loader == "dinov3":
+        model = torch.hub.load("facebookresearch/dinov3", model_name)
         embed_dim = model.embed_dim
         num_layers = len(model.blocks)
         num_heads = model.blocks[0].attn.num_heads
         feature_format = "token"
-        loader = "dinov2"
     else:
+        model = timm.create_model(model_name, pretrained=True, num_classes=0)
         embed_dim = model.num_features
         num_layers = 1
         num_heads = max(1, embed_dim // 64)
@@ -58,7 +38,11 @@ def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
             feature_format = "nchw"
         else:
             feature_format = "nhwc"
-        loader = "timm"
+
+    model = model.to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
 
     print(
         f"event=teacher_loaded model={model_name} embed_dim={embed_dim} "
@@ -77,6 +61,7 @@ def load_teacher(model_name: str, device: torch.device) -> TeacherModel:
 def _extract_vit(
     teacher_model: torch.nn.Module,
     x: torch.Tensor,
+    *,
     num_layers: int,
 ) -> TeacherIntermediates:
     hooks: list[torch.utils.hooks.RemovableHook] = []
@@ -120,12 +105,13 @@ def _extract_vit(
 def extract_intermediates(
     teacher_model: torch.nn.Module,
     x: torch.Tensor,
+    *,
     num_layers: int,
     loader: str,
     feature_format: str,
 ) -> TeacherIntermediates:
-    if loader == "dinov2":
-        return _extract_vit(teacher_model, x, num_layers)
+    if loader == "dinov3":
+        return _extract_vit(teacher_model, x, num_layers=num_layers)
     features = teacher_model.forward_features(x)
     if feature_format == "nhwc":
         features = features.permute(0, 3, 1, 2).flatten(2).transpose(1, 2)

@@ -5,10 +5,6 @@ from typing import Any
 
 import yaml
 
-__all__ = ["Config", "load_config", "save_config"]
-
-_DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "configs" / "defaults.yaml"
-
 
 class Config:
     def __init__(self, data: dict[str, Any]):
@@ -38,7 +34,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def load_config(config_path: str | Path) -> Config:
     from vit_inductive_bias_distillation.data.datasets import get_dataset_info
 
-    with open(_DEFAULTS_PATH) as f:
+    defaults_path = Path(__file__).resolve().parent.parent / "configs" / "defaults.yaml"
+    with open(defaults_path) as f:
         defaults = yaml.safe_load(f)
 
     with open(config_path) as f:
@@ -56,6 +53,13 @@ def load_config(config_path: str | Path) -> Config:
     merged["model"]["num_classes"] = dataset_info["num_classes"]
 
     return Config(merged)
+
+
+def setup_torch_backends() -> None:
+    import torch
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def save_config(config: Config, save_path: str | Path) -> None:

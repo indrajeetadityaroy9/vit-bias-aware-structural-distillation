@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.utils.flop_counter import FlopCounterMode
+from torchmetrics.classification import (
+    MulticlassAccuracy,
+    MulticlassCalibrationError,
+)
 
-__all__ = ["evaluate_model", "measure_efficiency"]
+from vit_inductive_bias_distillation.config import Config, save_config
+from vit_inductive_bias_distillation.data.datasets import (
+    create_eval_loader,
+    get_dataset_info,
+    get_subset_indices,
+)
 
 
 @torch.no_grad()
@@ -22,12 +33,13 @@ def evaluate_model(
 ) -> dict[str, Any]:
     model.eval()
 
-    total_loss = 0.0
-    correct_top1 = 0
-    correct_top5 = 0
-    total = 0
-    confusion = torch.zeros(num_classes, num_classes, device=device, dtype=torch.long)
     top_k = min(5, num_classes)
+    acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").to(device)
+    acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=top_k, average="micro").to(device)
+    ece = MulticlassCalibrationError(num_classes=num_classes, n_bins=15, norm="l1").to(device)
+
+    total_loss = 0.0
+    total = 0
 
     for inputs, targets in data_loader:
         inputs = inputs.to(device, non_blocking=True)
@@ -39,32 +51,17 @@ def evaluate_model(
             outputs = outputs[:, valid_indices]
 
         total_loss += criterion(outputs, targets).item() * inputs.size(0)
-
-        preds = outputs.argmax(dim=1)
-        correct_top1 += preds.eq(targets).sum().item()
-        correct_top5 += (
-            outputs.topk(top_k, dim=1).indices.eq(targets.unsqueeze(1)).any(dim=1).sum().item()
-        )
         total += targets.size(0)
 
-        confusion.view(-1).index_add_(
-            0, targets * num_classes + preds, torch.ones_like(preds),
-        )
-
-    tp = confusion.diag().float()
-    fp = confusion.sum(dim=0).float() - tp
-    fn = confusion.sum(dim=1).float() - tp
-    precision = tp / (tp + fp).clamp(min=1)
-    recall = tp / (tp + fn).clamp(min=1)
-    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
+        acc_top1.update(outputs, targets)
+        acc_top5.update(outputs, targets)
+        ece.update(outputs, targets)
 
     return {
-        "val_acc": 100.0 * correct_top1 / total,
-        "val_acc_top5": 100.0 * correct_top5 / total,
-        "precision_macro": precision.mean().item(),
-        "recall_macro": recall.mean().item(),
-        "f1_macro": f1.mean().item(),
+        "val_acc": 100.0 * acc_top1.compute().item(),
+        "val_acc_top5": 100.0 * acc_top5.compute().item(),
         "loss": total_loss / total,
+        "ece": ece.compute().item(),
     }
 
 
@@ -72,11 +69,12 @@ def evaluate_model(
 def measure_efficiency(
     model: nn.Module,
     device: torch.device,
+    *,
     image_size: int = 224,
     in_channels: int = 3,
     batch_size: int = 64,
-    num_warmup: int = 10,
-    num_batches: int = 50,
+    num_warmup: int = 50,
+    num_batches: int = 200,
 ) -> dict[str, float]:
     model.eval()
 
@@ -92,12 +90,14 @@ def measure_efficiency(
     dummy_batch = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
     for _ in range(num_warmup):
         model(dummy_batch)
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
     start = time.perf_counter()
     for _ in range(num_batches):
         model(dummy_batch)
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
     throughput = (batch_size * num_batches) / elapsed
@@ -108,3 +108,97 @@ def measure_efficiency(
         "gflops": gflops,
         "throughput_img_per_sec": throughput,
     }
+
+
+def evaluate_on_datasets(
+    model: nn.Module,
+    config: Config,
+    device: torch.device,
+    criterion: nn.Module,
+    *,
+    dataset_names: list[str],
+    primary_dataset: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    primary_results: dict[str, Any] = {}
+    robustness_results: dict[str, Any] = {}
+
+    for ds_name in dataset_names:
+        info = get_dataset_info(ds_name)
+        loader = create_eval_loader(
+            ds_name,
+            image_size=config.model.vit.img_size,
+            batch_size=config.data.batch_size,
+            num_workers=config.data.num_workers,
+        )
+
+        valid_indices = get_subset_indices(ds_name) if "parent_dataset" in info else None
+        num_classes = len(valid_indices) if valid_indices else info["num_classes"]
+
+        metrics = evaluate_model(
+            model, loader, device, criterion,
+            num_classes=num_classes, valid_indices=valid_indices,
+        )
+
+        if ds_name == primary_dataset:
+            primary_results = metrics
+        else:
+            robustness_results[ds_name] = metrics
+
+        print(
+            f"event=eval_dataset dataset={ds_name} "
+            f"top1={metrics['val_acc']:.4f} top5={metrics['val_acc_top5']:.4f} "
+            f"loss={metrics['loss']:.6f} ece={metrics['ece']:.6f}"
+        )
+
+    return primary_results, robustness_results
+
+
+def run_eval_suite(
+    model: nn.Module,
+    config: Config,
+    device: torch.device,
+    *,
+    config_path: str,
+) -> dict[str, Any]:
+    criterion = nn.CrossEntropyLoss()
+    datasets_to_eval = [config.data.dataset] + list(config.data.eval_datasets)
+
+    primary_results, robustness_results = evaluate_on_datasets(
+        model, config, device, criterion,
+        dataset_names=datasets_to_eval,
+        primary_dataset=config.data.dataset,
+    )
+
+    efficiency = measure_efficiency(
+        model, device,
+        image_size=config.model.vit.img_size,
+    )
+
+    print(
+        f"event=eval_efficiency dataset={config.data.dataset} "
+        f"params_m={efficiency['param_count_m']:.4f} gflops={efficiency['gflops']:.4f} "
+        f"throughput_img_per_sec={efficiency['throughput_img_per_sec']:.2f}"
+    )
+
+    return {
+        "run": {"name": config.run.name, "config": config_path},
+        "primary": {
+            "dataset": config.data.dataset,
+            **primary_results,
+        },
+        "robustness": robustness_results,
+        "efficiency": efficiency,
+    }
+
+
+def save_metrics(
+    results: dict[str, Any],
+    output_dir: Path,
+    config: Config,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_config(config, output_dir / "config.yaml")
+    metrics_path = output_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(results, f, indent=2)
+    return metrics_path

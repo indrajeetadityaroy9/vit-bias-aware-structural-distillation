@@ -11,38 +11,26 @@ import torch.optim as optim
 from accelerate import Accelerator
 from torch.optim.swa_utils import AveragedModel, SWALR
 
-from torchvision.transforms import MixUp, CutMix, RandomChoice
+from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
 from vit_inductive_bias_distillation.config import Config
 from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
 from vit_inductive_bias_distillation.losses.combined import BASDLoss
 from vit_inductive_bias_distillation.models.teacher import TeacherModel, extract_intermediates
 
-__all__ = ["BASDTrainer"]
 
-
-class BASDTrainer:
+class Trainer:
     def __init__(
         self,
         student_model: nn.Module,
-        teacher: TeacherModel,
         config: Config,
         accelerator: Accelerator,
-        steps_per_epoch: int,
+        teacher: TeacherModel | None = None,
     ):
         self.accelerator = accelerator
         self.device = accelerator.device
         self.config = config
-        self.teacher_model = teacher.model
-        total_steps = steps_per_epoch * config.training.num_epochs
-
-        self.token_layers = list(config.basd.token_layers)
-        self._teacher_num_layers = teacher.num_layers
-        self._teacher_loader = teacher.loader
-        self._teacher_feature_format = teacher.feature_format
-        student_embed_dim = student_model.embed_dim
-        student_num_tokens = student_model.patch_embed.num_patches
-        cross_attn_num_heads = max(1, teacher.embed_dim // 64)
+        self.distill = teacher is not None
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
         self.optimizer = optim.AdamW(
@@ -70,30 +58,38 @@ class BASDTrainer:
             milestones=[self.warmup_epochs],
         )
 
-        self.basd_loss = BASDLoss(
-            base_criterion=self.criterion,
-            student_dim=student_embed_dim,
-            teacher_dim=teacher.embed_dim,
-            num_student_tokens=student_num_tokens,
-            cross_attn_num_heads=cross_attn_num_heads,
-            config=config.basd,
-            total_steps=total_steps,
-            student_num_heads=config.model.vit.num_heads,
-            teacher_num_heads=teacher.num_heads,
-        ).to(self.device)
+        if self.distill:
+            self._teacher = teacher
+            student_embed_dim = student_model.embed_dim
+            student_num_tokens = student_model.patch_embed.num_patches
+            cross_attn_num_heads = max(1, teacher.embed_dim // 64)
 
-        self.optimizer.add_param_group({
-            "params": list(self.basd_loss.parameters()),
-            "lr": config.training.learning_rate,
-        })
+            self.basd_loss = BASDLoss(
+                base_criterion=self.criterion,
+                student_dim=student_embed_dim,
+                teacher_dim=teacher.embed_dim,
+                student_depth=student_model.depth,
+                num_student_tokens=student_num_tokens,
+                cross_attn_num_heads=cross_attn_num_heads,
+                config=config.basd,
+                student_num_heads=config.model.vit.num_heads,
+                teacher_num_heads=teacher.num_heads,
+            ).to(self.device)
+
+            self.token_layers = list(self.basd_loss.token_layers)
+
+            self.optimizer.add_param_group({
+                "params": list(self.basd_loss.parameters()),
+                "lr": config.training.learning_rate,
+            })
 
         self.model, self.optimizer, self.scheduler = accelerator.prepare(
             student_model, self.optimizer, self.scheduler
         )
 
-        accelerator.register_for_checkpointing(self.basd_loss)
+        if self.distill:
+            accelerator.register_for_checkpointing(self.basd_loss)
 
-        # Compile after Accelerate wrapping so graph capture includes distributed wrappers.
         self.model = torch.compile(self.model, mode="max-autotune")
 
         self.swa_model = AveragedModel(self.model)
@@ -117,12 +113,6 @@ class BASDTrainer:
             CutMix(alpha=1.0, num_classes=config.model.num_classes),
         ])
 
-        print(
-            f"event=trainer_init teacher={config.basd.teacher_model_name} "
-            f"teacher_dim={teacher.embed_dim} student_dim={student_embed_dim} "
-            f"token_layers={self.token_layers}"
-        )
-
     def save_checkpoint(self, name: str, epoch: int, metrics: dict[str, Any]) -> None:
         checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints" / name
         self.accelerator.save_state(str(checkpoint_dir))
@@ -132,8 +122,11 @@ class BASDTrainer:
             "best_val_acc": self.best_val_acc,
             "metrics_history": dict(self.metrics_history),
         }
+        if self.distill:
+            custom_state["schedule_state"] = self.basd_loss.schedule.state_dict()
+            custom_state["lagrangian_state"] = self.basd_loss.lagrangian_reg.state_dict()
         torch.save(custom_state, checkpoint_dir / "custom_state.pth")
-        print(f"event=checkpoint_saved path={checkpoint_dir} epoch={epoch + 1}")
+        print(f"event=checkpoint_saved path={checkpoint_dir} epoch={epoch + 1} name={name}")
 
     def save_model_for_eval(self, filename: str, epoch: int) -> None:
         checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints"
@@ -141,6 +134,15 @@ class BASDTrainer:
         unwrapped = self.accelerator.unwrap_model(self.model)
         torch.save(
             {"epoch": epoch, "model_state_dict": unwrapped.state_dict()},
+            checkpoint_dir / filename,
+        )
+
+    def save_swa_for_eval(self, filename: str, epoch: int) -> None:
+        checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        unwrapped_swa = self.accelerator.unwrap_model(self.swa_model.module)
+        torch.save(
+            {"epoch": epoch, "model_state_dict": unwrapped_swa.state_dict()},
             checkpoint_dir / filename,
         )
 
@@ -154,6 +156,9 @@ class BASDTrainer:
         )
         self.best_val_acc = custom["best_val_acc"]
         self.metrics_history = defaultdict(list, custom["metrics_history"])
+        if self.distill:
+            self.basd_loss.schedule.load_state_dict(custom["schedule_state"])
+            self.basd_loss.lagrangian_reg.load_state_dict(custom["lagrangian_state"])
         return custom["epoch"] + 1
 
     def step_scheduler(self, epoch: int) -> None:
@@ -177,14 +182,61 @@ class BASDTrainer:
         train_loader: torch.utils.data.DataLoader,
     ) -> dict[str, Any]:
         self.model.train()
-        self.teacher_model.eval()
 
+        if self.distill:
+            return self._train_epoch_distill(train_loader)
+        return self._train_epoch_baseline(train_loader)
+
+    def _train_epoch_baseline(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+    ) -> dict[str, Any]:
         total_loss = 0.0
-        total_ce_loss = 0.0
-        total_rsd_loss = 0.0
-        total_rel_loss = 0.0
-        total_attn_loss = 0.0
-        total_spectral_loss = 0.0
+        correct = 0
+        total = 0
+        batch_count = 0
+
+        for inputs, targets in train_loader:
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+
+            inputs, mixed_targets = self.mixup_cutmix(inputs, targets)
+
+            with self.accelerator.autocast():
+                student_results = self.model(inputs)
+                loss = self.criterion(student_results.output, mixed_targets)
+
+            self.accelerator.backward(loss)
+
+            self.accelerator.clip_grad_norm_(
+                self.model.parameters(),
+                self._grad_clip_norm,
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            total_loss += loss.item()
+            predicted = student_results.output.argmax(1)
+            correct += predicted.eq(targets).sum().item()
+            total += targets.size(0)
+            batch_count += 1
+
+            self.global_step += 1
+
+        return {
+            "train_total_loss": total_loss / batch_count,
+            "train_acc": 100.0 * correct / total,
+            "total_samples": total,
+        }
+
+    def _train_epoch_distill(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+    ) -> dict[str, Any]:
+        self._teacher.model.eval()
+
+        _LOSS_KEYS = ("ce_loss", "rsd_loss", "rel_loss", "attn_loss", "spectral_loss")
+        loss_accum: dict[str, float] = defaultdict(float)
         correct = 0
         total = 0
         batch_count = 0
@@ -203,9 +255,10 @@ class BASDTrainer:
                 )
 
                 teacher_results = extract_intermediates(
-                    self.teacher_model, clean_imgs, self._teacher_num_layers,
-                    loader=self._teacher_loader,
-                    feature_format=self._teacher_feature_format,
+                    self._teacher.model, clean_imgs,
+                    num_layers=self._teacher.num_layers,
+                    loader=self._teacher.loader,
+                    feature_format=self._teacher.feature_format,
                 )
 
                 loss, loss_dict = self.basd_loss(
@@ -219,21 +272,20 @@ class BASDTrainer:
                 )
 
             self.accelerator.backward(loss)
+            self.basd_loss.post_step_update(loss_dict)
+
             self.accelerator.clip_grad_norm_(
                 list(self.model.parameters())
                 + list(self.basd_loss.parameters()),
                 self._grad_clip_norm,
             )
             self.optimizer.step()
-            self.basd_loss.layer_selector.project_to_stiefel()
+            self.basd_loss.project_to_stiefel()
             self.optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item()
-            total_ce_loss += loss_dict["ce_loss"]
-            total_rsd_loss += loss_dict["rsd_loss"]
-            total_rel_loss += loss_dict["rel_loss"]
-            total_attn_loss += loss_dict["attn_loss"]
-            total_spectral_loss += loss_dict["spectral_loss"]
+            loss_accum["total_loss"] += loss.item()
+            for key in _LOSS_KEYS:
+                loss_accum[key] += loss_dict[key]
 
             predicted = student_results.output.argmax(1)
             correct += predicted.eq(targets).sum().item()
@@ -242,16 +294,9 @@ class BASDTrainer:
 
             self.global_step += 1
 
-        result = {
-            "train_loss": total_loss / batch_count,
-            "train_ce_loss": total_ce_loss / batch_count,
-            "train_rsd_loss": total_rsd_loss / batch_count,
-            "train_rel_loss": total_rel_loss / batch_count,
-            "train_attn_loss": total_attn_loss / batch_count,
-            "train_spectral_loss": total_spectral_loss / batch_count,
-            "train_acc": 100.0 * correct / total,
-            "total_samples": total,
-        }
+        result = {f"train_{k}": v / batch_count for k, v in loss_accum.items()}
+        result["train_acc"] = 100.0 * correct / total
+        result["total_samples"] = total
         for key in loss_dict:
             if key.startswith("weight_"):
                 result[key] = loss_dict[key]
@@ -264,8 +309,6 @@ class BASDTrainer:
         start_epoch: int = 0,
     ) -> dict[str, list[Any]]:
         num_epochs = self.config.training.num_epochs
-
-        print(f"event=train_config epochs={num_epochs} batch_size={self.config.data.batch_size}")
 
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
@@ -285,19 +328,31 @@ class BASDTrainer:
             current_lr = self.optimizer.param_groups[0]["lr"]
             throughput = train_metrics["total_samples"] / epoch_time
 
-            print(
-                f"event=epoch_summary epoch={epoch + 1} num_epochs={num_epochs} "
-                f"train_loss={train_metrics['train_loss']:.4f} "
-                f"ce={train_metrics['train_ce_loss']:.4f} "
-                f"rsd={train_metrics['train_rsd_loss']:.4f} "
-                f"rel={train_metrics['train_rel_loss']:.4f} "
-                f"attn={train_metrics['train_attn_loss']:.4f} "
-                f"spectral={train_metrics['train_spectral_loss']:.4f} "
-                f"train_acc={train_metrics['train_acc']:.2f} "
-                f"val_acc={val_metrics['val_acc']:.2f} "
-                f"lr={current_lr:.2e} epoch_time_s={epoch_time:.1f} "
-                f"throughput_img_per_sec={throughput:.0f}"
-            )
+            if self.distill:
+                print(
+                    f"event=epoch_summary mode=distill epoch={epoch + 1} num_epochs={num_epochs} "
+                    f"train_loss={train_metrics['train_total_loss']:.6f} "
+                    f"ce={train_metrics['train_ce_loss']:.6f} "
+                    f"rsd={train_metrics['train_rsd_loss']:.6f} "
+                    f"rel={train_metrics['train_rel_loss']:.6f} "
+                    f"attn={train_metrics['train_attn_loss']:.6f} "
+                    f"spectral={train_metrics['train_spectral_loss']:.6f} "
+                    f"train_acc={train_metrics['train_acc']:.4f} "
+                    f"val_acc={val_metrics['val_acc']:.4f} "
+                    f"lr={current_lr:.8f} "
+                    f"epoch_time_s={epoch_time:.3f} "
+                    f"throughput_img_per_sec={throughput:.2f}"
+                )
+            else:
+                print(
+                    f"event=epoch_summary mode=baseline epoch={epoch + 1} num_epochs={num_epochs} "
+                    f"train_loss={train_metrics['train_total_loss']:.6f} "
+                    f"train_acc={train_metrics['train_acc']:.4f} "
+                    f"val_acc={val_metrics['val_acc']:.4f} "
+                    f"lr={current_lr:.8f} "
+                    f"epoch_time_s={epoch_time:.3f} "
+                    f"throughput_img_per_sec={throughput:.2f}"
+                )
 
             for key, value in {**train_metrics, **val_metrics}.items():
                 self.metrics_history[key].append(value)
@@ -313,10 +368,17 @@ class BASDTrainer:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}", epoch, val_metrics)
 
             if self.should_early_stop(val_metrics["loss"]):
-                print(f"event=early_stop epoch={epoch + 1} val_loss={val_metrics['loss']:.4f}")
+                print(f"event=early_stop epoch={epoch + 1} val_loss={val_metrics['loss']:.6f}")
                 break
 
-        torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
-        print(f"event=train_complete best_val_acc={self.best_val_acc:.2f}")
+        if self.distill:
+            def _bn_loader():
+                for clean, _aug, targets in train_loader:
+                    yield clean, targets
+            torch.optim.swa_utils.update_bn(_bn_loader(), self.swa_model, self.device)
+        else:
+            torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
+        self.save_swa_for_eval("best_model.pth", epoch)
+        print(f"event=train_complete best_val_acc={self.best_val_acc:.4f}")
 
         return dict(self.metrics_history)

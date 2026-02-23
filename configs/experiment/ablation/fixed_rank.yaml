@@ -1,5 +1,5 @@
 run:
-  name: basd_imagenet
+  name: ablation_fixed_rank
 
 data:
   dataset: ILSVRC/imagenet-1k
@@ -10,3 +10,6 @@ data:
 
 model:
   student_preset: deit_tiny
+
+basd:
+  layer_selector_fixed_rank: 8

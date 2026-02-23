@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["RedundancySuppressionLoss"]
-
 
 class RedundancySuppressionLoss(nn.Module):
     def __init__(
@@ -13,6 +11,7 @@ class RedundancySuppressionLoss(nn.Module):
         student_dim: int,
         teacher_dim: int,
         num_layers: int,
+        *,
         kappa: float = 0.01,
     ):
         super().__init__()
@@ -52,7 +51,7 @@ class RedundancySuppressionLoss(nn.Module):
             ).reshape(B, N, D_t)
 
             s_norm = F.normalize(s_flat.reshape(-1, D_t), dim=0)
-            # Detach teacher branch to keep gradients on student projectors only.
+            # Keep gradients on student-side AAD projectors.
             t_norm = F.normalize(teacher_tokens.detach().reshape(-1, D_t), dim=0)
 
             cc = s_norm.T @ t_norm
@@ -67,6 +66,5 @@ class RedundancySuppressionLoss(nn.Module):
             loss_dict[f"rsd_layer_{layer_idx}"] = layer_loss.item()
 
         total_loss = total_loss / len(layer_indices)
-        loss_dict["rsd_loss_total"] = total_loss.item()
 
         return total_loss, loss_dict

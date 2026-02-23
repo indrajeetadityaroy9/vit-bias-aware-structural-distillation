@@ -1,53 +1,45 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+import torch
 import torch.utils.data
 from datasets import Image, ClassLabel, load_dataset, load_dataset_builder
 from torch.utils.data import DataLoader
+from torchvision.transforms.v2 import (
+    CenterCrop,
+    Compose,
+    Normalize,
+    RandomErasing,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    Resize,
+    ToDtype,
+    ToImage,
+    TrivialAugmentWide,
+)
 
 from vit_inductive_bias_distillation.config import Config
-from vit_inductive_bias_distillation.data.transforms import build_eval_transform, build_train_transform
 
-__all__ = ["HFDataset", "get_dataset_info", "get_subset_indices", "create_dataloaders"]
-
-_HF_ALIASES: dict[str, str] = {
-    "imagenet1k": "ILSVRC/imagenet-1k",
-    "cifar100": "uoft-cs/cifar100",
-    "cifar10": "uoft-cs/cifar10",
-    "flowers102": "nelorth/oxford-flowers",
-    "stanford_cars": "tanganke/stanford_cars",
-    "imagenet_a": "barkermrl/imagenet-a",
-    "imagenet_r": "axiong/imagenet-r",
-    "imagenet_sketch": "songweig/imagenet_sketch",
-}
 
 _PARENT_DATASETS: dict[str, str] = {
-    "imagenet_a": "imagenet1k",
-    "imagenet_r": "imagenet1k",
+    "barkermrl/imagenet-a": "ILSVRC/imagenet-1k",
+    "axiong/imagenet-r": "ILSVRC/imagenet-1k",
+    "songweig/imagenet_sketch": "ILSVRC/imagenet-1k",
 }
 
 
 def _detect_column_keys(features: dict) -> tuple[str, str]:
-    image_key = None
-    label_key = None
-    for name, feat in features.items():
-        if isinstance(feat, Image) and image_key is None:
-            image_key = name
-        elif isinstance(feat, ClassLabel) and label_key is None:
-            label_key = name
-    if image_key is None or label_key is None:
-        raise ValueError(
-            f"Could not auto-detect image/label columns from features: {list(features)}"
-        )
+    image_key = next(name for name, feat in features.items() if isinstance(feat, Image))
+    label_key = next(name for name, feat in features.items() if isinstance(feat, ClassLabel))
     return image_key, label_key
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=8)
 def _compute_channel_stats(
-    hf_path: str, split: str, image_key: str, n_samples: int = 5000,
+    hf_path: str, split: str, image_key: str, *, n_samples: int = 5000,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     ds = load_dataset(hf_path, split=split, streaming=True)
 
@@ -72,88 +64,111 @@ def _compute_channel_stats(
 
 @lru_cache(maxsize=16)
 def get_dataset_info(dataset_name: str) -> dict[str, Any]:
-    hf_path = _HF_ALIASES.get(dataset_name, dataset_name)
-    builder = load_dataset_builder(hf_path)
+    builder = load_dataset_builder(dataset_name)
     features = builder.info.features
     available_splits = set(builder.info.splits.keys())
 
     image_key, label_key = _detect_column_keys(features)
     num_classes = features[label_key].num_classes
+    class_names = features[label_key].names
 
-    split_map: dict[str, str] = {}
-    if "train" in available_splits:
-        split_map["train"] = "train"
-    if "validation" in available_splits:
-        split_map["val"] = "validation"
-    elif "test" in available_splits:
-        split_map["val"] = "test"
-    elif "train" in available_splits:
-        split_map["val"] = "train"
+    val_split_name = "validation" if "validation" in available_splits else "test"
+    split_map: dict[str, str] = {"train": "train", "val": val_split_name}
 
-    stats_split = split_map.get("train", split_map.get("val"))
-    mean, std = _compute_channel_stats(hf_path, stats_split, image_key)
+    if dataset_name in _PARENT_DATASETS:
+        parent_info = get_dataset_info(_PARENT_DATASETS[dataset_name])
+        mean, std = parent_info["mean"], parent_info["std"]
+    else:
+        mean, std = _compute_channel_stats(dataset_name, split_map["train"], image_key)
 
     result: dict[str, Any] = {
-        "hf_path": hf_path,
         "image_key": image_key,
         "label_key": label_key,
         "num_classes": num_classes,
+        "class_names": class_names,
         "split_map": split_map,
         "mean": mean,
         "std": std,
     }
 
-    parent = _PARENT_DATASETS.get(dataset_name)
-    if parent is not None:
-        result["parent_dataset"] = parent
+    if dataset_name in _PARENT_DATASETS:
+        result["parent_dataset"] = _PARENT_DATASETS[dataset_name]
 
     return result
 
 
-@lru_cache(maxsize=4)
-def get_subset_indices(subset_name: str) -> list[int]:
-    info = get_dataset_info(subset_name)
-    parent_name = info.get("parent_dataset")
-    if parent_name is None:
-        raise ValueError(f"{subset_name} has no parent_dataset defined")
+@lru_cache(maxsize=16)
+def get_subset_indices(subset_name: str) -> tuple[int, ...]:
+    subset_info = get_dataset_info(subset_name)
+    parent_info = get_dataset_info(subset_info["parent_dataset"])
 
-    parent_info = get_dataset_info(parent_name)
+    parent_name_to_idx = {name: idx for idx, name in enumerate(parent_info["class_names"])}
 
-    subset_builder = load_dataset_builder(info["hf_path"])
-    parent_builder = load_dataset_builder(parent_info["hf_path"])
+    return tuple(sorted(parent_name_to_idx[name] for name in subset_info["class_names"]))
 
-    subset_features = subset_builder.info.features
-    parent_features = parent_builder.info.features
 
-    _, subset_label_key = _detect_column_keys(subset_features)
-    _, parent_label_key = _detect_column_keys(parent_features)
+class DualTransform:
+    def __init__(
+        self,
+        clean_transform: Compose,
+        augmented_transform: Compose,
+    ):
+        self.clean_transform = clean_transform
+        self.augmented_transform = augmented_transform
 
-    subset_class_names = subset_features[subset_label_key].names
-    parent_class_names = parent_features[parent_label_key].names
+    def __call__(self, img):
+        return self.clean_transform(img), self.augmented_transform(img)
 
-    parent_name_to_idx = {name: idx for idx, name in enumerate(parent_class_names)}
 
-    indices = []
-    for name in subset_class_names:
-        if name in parent_name_to_idx:
-            indices.append(parent_name_to_idx[name])
+def build_augmented_transform(
+    image_size: int,
+    *,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+) -> Compose:
+    return Compose([
+        RandomResizedCrop(image_size),
+        RandomHorizontalFlip(),
+        TrivialAugmentWide(),
+        ToImage(),
+        ToDtype(torch.float32, scale=True),
+        Normalize(mean, std),
+        RandomErasing(p=0.25),
+    ])
 
-    if len(indices) != len(subset_class_names):
-        matched = len(indices)
-        expected = len(subset_class_names)
-        raise ValueError(
-            f"Only matched {matched}/{expected} class names from "
-            f"{subset_name} to {parent_name}"
-        )
 
-    return sorted(indices)
+def build_train_transform(
+    image_size: int,
+    *,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+) -> DualTransform:
+    return DualTransform(
+        build_eval_transform(image_size, mean=mean, std=std),
+        build_augmented_transform(image_size, mean=mean, std=std),
+    )
+
+
+def build_eval_transform(
+    image_size: int,
+    *,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+) -> Compose:
+    return Compose([
+        Resize(image_size + 32),
+        CenterCrop(image_size),
+        ToImage(),
+        ToDtype(torch.float32, scale=True),
+        Normalize(mean, std),
+    ])
 
 
 class HFDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_name: str, split: str, transform: Any):
         info = get_dataset_info(dataset_name)
         hf_split = info["split_map"][split]
-        self.dataset = load_dataset(info["hf_path"], split=hf_split)
+        self.dataset = load_dataset(dataset_name, split=hf_split)
         self.transform = transform
         self._image_key = info["image_key"]
         self._label_key = info["label_key"]
@@ -170,40 +185,56 @@ class HFDataset(torch.utils.data.Dataset):
         return transformed, item[self._label_key]
 
 
-def create_dataloaders(
-    config: Config,
-) -> tuple[DataLoader, DataLoader]:
-    info = get_dataset_info(config.data.dataset)
-    image_size = config.model.vit.img_size
-    mean = info["mean"]
-    std = info["std"]
-
-    train_transform = build_train_transform(image_size, mean, std)
-    eval_transform = build_eval_transform(image_size, mean, std)
-
-    train_dataset = HFDataset(config.data.dataset, "train", train_transform)
-    val_dataset = HFDataset(config.data.dataset, "val", eval_transform)
-
-    num_workers = config.data.num_workers
-    batch_size = config.data.batch_size
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        drop_last=True,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
+def create_eval_loader(
+    dataset_name: str,
+    *,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    info = get_dataset_info(dataset_name)
+    transform = build_eval_transform(image_size, mean=info["mean"], std=info["std"])
+    dataset = HFDataset(dataset_name, "val", transform)
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
+    )
+
+
+def create_dataloaders(
+    config: Config,
+    *,
+    view_mode: Literal["dual", "single"] = "dual",
+) -> tuple[DataLoader, DataLoader]:
+    info = get_dataset_info(config.data.dataset)
+    image_size = config.model.vit.img_size
+
+    if view_mode == "dual":
+        train_transform = build_train_transform(image_size, mean=info["mean"], std=info["std"])
+    else:
+        train_transform = build_augmented_transform(image_size, mean=info["mean"], std=info["std"])
+
+    train_dataset = HFDataset(config.data.dataset, "train", train_transform)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True,
+    )
+
+    val_loader = create_eval_loader(
+        config.data.dataset,
+        image_size=image_size,
+        batch_size=config.data.batch_size,
+        num_workers=config.data.num_workers,
     )
 
     return train_loader, val_loader

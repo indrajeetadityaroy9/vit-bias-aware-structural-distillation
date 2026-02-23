@@ -1,64 +1,42 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-__all__ = ["RelationalLoss"]
 
 
-class RelationalLoss(nn.Module):
-    # Match token geometry with pairwise directions and triplet angles.
+class GeometricRelationalLoss(nn.Module):
+    """Procrustes loss with optional CLS-attention weighting.
 
-    def __init__(self, num_pairs: int = 128, num_triplets: int = 64, angle_weight: float = 0.5):
+    Teacher tokens remain attached to preserve projector gradients.
+    """
+
+    def __init__(self, *, attn_weighted: Literal["weighted", "unweighted"] = "weighted"):
         super().__init__()
-        self.num_pairs = num_pairs
-        self.num_triplets = num_triplets
-        self.angle_weight = angle_weight
+        self.attn_weighted = attn_weighted
 
     def forward(
-        self, student_tokens: torch.Tensor, teacher_tokens: torch.Tensor
+        self,
+        student_tokens: torch.Tensor,
+        teacher_tokens: torch.Tensor,
+        teacher_attn: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B, N, D_s = student_tokens.shape
-        _, _, D_t = teacher_tokens.shape
-        device = student_tokens.device
-        K = min(self.num_pairs, N * (N - 1) // 2)
+        s = student_tokens.float()
+        t = teacher_tokens.float()
 
-        idx_i = torch.randint(0, N, (K,), device=device)
-        idx_j = torch.randint(0, N - 1, (K,), device=device)
-        idx_j = idx_j + (idx_j >= idx_i).long()
+        if self.attn_weighted == "weighted" and teacher_attn is not None:
+            w = teacher_attn[:, :, 0, 1:].mean(dim=1)
+            w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)
+            s = w.unsqueeze(-1) * s
+            t = w.unsqueeze(-1) * t
 
-        s_diff = F.normalize(
-            student_tokens[:, idx_i, :] - student_tokens[:, idx_j, :], dim=-1
-        )
-        t_diff = F.normalize(
-            teacher_tokens[:, idx_i, :] - teacher_tokens[:, idx_j, :], dim=-1
-        )
+        s_c = s - s.mean(dim=1, keepdim=True)
+        t_c = t - t.mean(dim=1, keepdim=True)
 
-        target_d = min(D_s, D_t)
-        if D_s != target_d:
-            s_diff = F.adaptive_avg_pool1d(s_diff, target_d)
-        if D_t != target_d:
-            t_diff = F.adaptive_avg_pool1d(t_diff, target_d)
+        tr_s = (s_c * s_c).sum(dim=(1, 2))
+        tr_t = (t_c * t_c).sum(dim=(1, 2))
+        cross = torch.bmm(s_c.transpose(1, 2), t_c)
+        nuclear = torch.linalg.svdvals(cross).sum(dim=-1)
 
-        dist_loss = F.smooth_l1_loss(s_diff, t_diff)
-
-        T = min(self.num_triplets, K)
-        idx_k = torch.randint(0, N, (T,), device=device)
-        # Enforce distinct triplets to avoid zero-length direction vectors.
-        collides = (idx_k == idx_i[:T]) | (idx_k == idx_j[:T])
-        while collides.any():
-            idx_k[collides] = torch.randint(0, N, (collides.sum(),), device=device)
-            collides = (idx_k == idx_i[:T]) | (idx_k == idx_j[:T])
-
-        e_ij_s = F.normalize(student_tokens[:, idx_i[:T]] - student_tokens[:, idx_j[:T]], dim=-1)
-        e_kj_s = F.normalize(student_tokens[:, idx_k] - student_tokens[:, idx_j[:T]], dim=-1)
-        s_cos = (e_ij_s * e_kj_s).sum(dim=-1)
-
-        e_ij_t = F.normalize(teacher_tokens[:, idx_i[:T]] - teacher_tokens[:, idx_j[:T]], dim=-1)
-        e_kj_t = F.normalize(teacher_tokens[:, idx_k] - teacher_tokens[:, idx_j[:T]], dim=-1)
-        t_cos = (e_ij_t * e_kj_t).sum(dim=-1)
-
-        angle_loss = F.smooth_l1_loss(s_cos, t_cos.detach())
-
-        return dist_loss + self.angle_weight * angle_loss
+        return (tr_s + tr_t - 2.0 * nuclear).clamp(min=0.0).mean()

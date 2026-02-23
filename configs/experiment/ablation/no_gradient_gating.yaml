@@ -1,5 +1,5 @@
 run:
-  name: basd_imagenet
+  name: ablation_no_gradient_gating
 
 data:
   dataset: ILSVRC/imagenet-1k
@@ -10,3 +10,6 @@ data:
 
 model:
   student_preset: deit_tiny
+
+basd:
+  use_gradient_gating: false
