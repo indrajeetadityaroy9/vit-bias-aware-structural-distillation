@@ -23,7 +23,7 @@ def main() -> None:
 
     model = DeiT(config.model.vit, config.model).to(accelerator.device)
 
-    ckpt = torch.load(config.checkpoint.path, map_location=accelerator.device, weights_only=True)
+    ckpt = torch.load(config.checkpoint.path, map_location=accelerator.device)
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"event=checkpoint_loaded path={config.checkpoint.path} epoch={ckpt['epoch']}")
 

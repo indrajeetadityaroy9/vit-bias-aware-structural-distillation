@@ -5,7 +5,6 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-import torch.utils.data
 from datasets import Image, ClassLabel, load_dataset, load_dataset_builder
 from torch.utils.data import DataLoader
 from torchvision.transforms.v2 import (
@@ -107,24 +106,22 @@ def get_subset_indices(subset_name: str) -> tuple[int, ...]:
     return tuple(sorted(parent_name_to_idx[name] for name in subset_info["class_names"]))
 
 
-class DualTransform:
-    def __init__(
-        self,
-        clean_transform: Compose,
-        augmented_transform: Compose,
-    ):
-        self.clean_transform = clean_transform
-        self.augmented_transform = augmented_transform
-
-    def __call__(self, img):
-        return self.clean_transform(img), self.augmented_transform(img)
+def _resolve_channel_stats(
+    config: Config, dataset_name: str,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    stats = config.data.channel_stats
+    if isinstance(stats, Config) and hasattr(stats, "mean") and hasattr(stats, "std"):
+        return tuple(stats.mean), tuple(stats.std)
+    info = get_dataset_info(dataset_name)
+    return info["mean"], info["std"]
 
 
-def build_augmented_transform(
+def _build_augmented_transform(
     image_size: int,
     *,
     mean: tuple[float, ...],
     std: tuple[float, ...],
+    random_erasing_prob: float,
 ) -> Compose:
     return Compose([
         RandomResizedCrop(image_size),
@@ -133,30 +130,19 @@ def build_augmented_transform(
         ToImage(),
         ToDtype(torch.float32, scale=True),
         Normalize(mean, std),
-        RandomErasing(p=0.25),
+        RandomErasing(p=random_erasing_prob),
     ])
 
 
-def build_train_transform(
+def _build_eval_transform(
     image_size: int,
     *,
     mean: tuple[float, ...],
     std: tuple[float, ...],
-) -> DualTransform:
-    return DualTransform(
-        build_eval_transform(image_size, mean=mean, std=std),
-        build_augmented_transform(image_size, mean=mean, std=std),
-    )
-
-
-def build_eval_transform(
-    image_size: int,
-    *,
-    mean: tuple[float, ...],
-    std: tuple[float, ...],
+    eval_resize_padding: int,
 ) -> Compose:
     return Compose([
-        Resize(image_size + 32),
+        Resize(image_size + eval_resize_padding),
         CenterCrop(image_size),
         ToImage(),
         ToDtype(torch.float32, scale=True),
@@ -164,25 +150,31 @@ def build_eval_transform(
     ])
 
 
-class HFDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset_name: str, split: str, transform: Any):
-        info = get_dataset_info(dataset_name)
-        hf_split = info["split_map"][split]
-        self.dataset = load_dataset(dataset_name, split=hf_split)
-        self.transform = transform
-        self._image_key = info["image_key"]
-        self._label_key = info["label_key"]
+def _single_transform(
+    examples: dict,
+    transform: Compose,
+    image_key: str,
+    label_key: str,
+) -> dict:
+    return {
+        "pixel_values": [transform(img.convert("RGB")) for img in examples[image_key]],
+        "label": examples[label_key],
+    }
 
-    def __len__(self) -> int:
-        return len(self.dataset)
 
-    def __getitem__(self, idx: int):
-        item = self.dataset[idx]
-        image = item[self._image_key].convert("RGB")
-        transformed = self.transform(image)
-        if isinstance(transformed, tuple):
-            return (*transformed, item[self._label_key])
-        return transformed, item[self._label_key]
+def _dual_transform(
+    examples: dict,
+    clean_tf: Compose,
+    aug_tf: Compose,
+    image_key: str,
+    label_key: str,
+) -> dict:
+    images = [img.convert("RGB") for img in examples[image_key]]
+    return {
+        "clean": [clean_tf(img) for img in images],
+        "augmented": [aug_tf(img) for img in images],
+        "label": examples[label_key],
+    }
 
 
 def create_eval_loader(
@@ -191,12 +183,23 @@ def create_eval_loader(
     image_size: int,
     batch_size: int,
     num_workers: int,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+    eval_resize_padding: int,
 ) -> DataLoader:
     info = get_dataset_info(dataset_name)
-    transform = build_eval_transform(image_size, mean=info["mean"], std=info["std"])
-    dataset = HFDataset(dataset_name, "val", transform)
+    transform = _build_eval_transform(
+        image_size, mean=mean, std=std, eval_resize_padding=eval_resize_padding,
+    )
+    image_key, label_key = info["image_key"], info["label_key"]
+
+    ds = load_dataset(dataset_name, split=info["split_map"]["val"])
+    ds.set_transform(
+        lambda ex: _single_transform(ex, transform, image_key, label_key)
+    )
+
     return DataLoader(
-        dataset,
+        ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -211,17 +214,32 @@ def create_dataloaders(
     view_mode: Literal["dual", "single"] = "dual",
 ) -> tuple[DataLoader, DataLoader]:
     info = get_dataset_info(config.data.dataset)
+    mean, std = _resolve_channel_stats(config, config.data.dataset)
     image_size = config.model.vit.img_size
+    image_key, label_key = info["image_key"], info["label_key"]
+
+    aug_tf = _build_augmented_transform(
+        image_size, mean=mean, std=std,
+        random_erasing_prob=config.data.random_erasing_prob,
+    )
+
+    train_ds = load_dataset(config.data.dataset, split=info["split_map"]["train"])
 
     if view_mode == "dual":
-        train_transform = build_train_transform(image_size, mean=info["mean"], std=info["std"])
+        eval_tf = _build_eval_transform(
+            image_size, mean=mean, std=std,
+            eval_resize_padding=config.data.eval_resize_padding,
+        )
+        train_ds.set_transform(
+            lambda ex: _dual_transform(ex, eval_tf, aug_tf, image_key, label_key)
+        )
     else:
-        train_transform = build_augmented_transform(image_size, mean=info["mean"], std=info["std"])
-
-    train_dataset = HFDataset(config.data.dataset, "train", train_transform)
+        train_ds.set_transform(
+            lambda ex: _single_transform(ex, aug_tf, image_key, label_key)
+        )
 
     train_loader = DataLoader(
-        train_dataset,
+        train_ds,
         batch_size=config.data.batch_size,
         shuffle=True,
         num_workers=config.data.num_workers,
@@ -235,6 +253,9 @@ def create_dataloaders(
         image_size=image_size,
         batch_size=config.data.batch_size,
         num_workers=config.data.num_workers,
+        mean=mean,
+        std=std,
+        eval_resize_padding=config.data.eval_resize_padding,
     )
 
     return train_loader, val_loader

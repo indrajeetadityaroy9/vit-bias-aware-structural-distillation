@@ -87,7 +87,7 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads)
-        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path = DropPath(drop_prob=drop_path)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, int(dim * mlp_ratio))
 

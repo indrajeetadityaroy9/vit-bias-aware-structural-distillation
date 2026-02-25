@@ -25,9 +25,9 @@ class BuresWassersteinLoss(nn.Module):
         D_s, D_t = s.shape[2], t.shape[2]
         if D_s != D_t:
             target_d = min(D_s, D_t)
-            if D_s != target_d:
+            if D_s > D_t:
                 s = F.adaptive_avg_pool1d(s, target_d)
-            if D_t != target_d:
+            else:
                 t = F.adaptive_avg_pool1d(t, target_d)
 
         B, N, D = s.shape

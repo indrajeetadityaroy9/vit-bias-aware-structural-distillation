@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-logger = logging.getLogger(__name__)
 
 from vit_inductive_bias_distillation.losses.attention import AttentionDistillationLoss
 from vit_inductive_bias_distillation.losses.layer_selector import (
@@ -64,17 +61,14 @@ class GradientGatedSchedule:
         self._activated: dict[str, bool] = {n: False for n in component_names}
         self._activated[component_names[0]] = True
 
-    def get_ramp(self, component: str, step: int) -> float:
+    def get_ramp(self, component: str) -> float:
         if self._activated[component]:
             return 1.0
         buf = self._grad_norms[component]
         if len(buf) < self.window // 2:
             return 0.0
         t = torch.tensor(buf, dtype=torch.float32)
-        mean = t.mean().item()
-        if mean < 1e-12:
-            return 0.0
-        cv = t.std().item() / mean
+        cv = t.std().item() / t.mean().item()
         if cv < 1.0:
             self._activated[component] = True
             return 1.0
@@ -87,10 +81,15 @@ class GradientGatedSchedule:
             buf.pop(0)
 
     def state_dict(self) -> dict:
-        return {"activated": dict(self._activated)}
+        return {
+            "activated": dict(self._activated),
+            "grad_norms": {k: list(v) for k, v in self._grad_norms.items()},
+        }
 
     def load_state_dict(self, state: dict) -> None:
         self._activated.update(state["activated"])
+        for k, v in state.get("grad_norms", {}).items():
+            self._grad_norms[k] = list(v)
 
 
 class LagrangianRegularizer:
@@ -119,18 +118,18 @@ class LagrangianRegularizer:
 
 
 class CrossAttentionProjector(nn.Module):
-    def __init__(self, num_student_tokens: int, teacher_dim: int, student_dim: int, *, num_heads: int = 4):
+    def __init__(self, num_student_tokens: int, teacher_dim: int, proj_dim: int, *, num_heads: int = 4):
         super().__init__()
         self.num_student_tokens = num_student_tokens
 
-        self.teacher_proj = nn.Linear(teacher_dim, student_dim)
-        self.queries = nn.Parameter(torch.randn(1, num_student_tokens, student_dim) * 0.02)
+        self.teacher_proj = nn.Linear(teacher_dim, proj_dim)
+        self.queries = nn.Parameter(torch.randn(1, num_student_tokens, proj_dim) * 0.02)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=student_dim,
+            embed_dim=proj_dim,
             num_heads=num_heads,
             batch_first=True,
         )
-        self.norm = nn.LayerNorm(student_dim)
+        self.norm = nn.LayerNorm(proj_dim)
 
     def forward(self, teacher_tokens: torch.Tensor) -> torch.Tensor:
         B = teacher_tokens.shape[0]
@@ -177,17 +176,11 @@ class BASDLoss(nn.Module):
         self.use_gradient_gating = config.use_gradient_gating
         self.use_lagrangian_reg = config.use_lagrangian_reg
 
-        if "rel" in self.disabled_components:
-            logger.warning(
-                "Relational loss disabled — CrossAttentionProjector.teacher_proj "
-                "receives no gradients; Stiefel retraction is meaningless"
-            )
-
         self.cross_attn_projectors = nn.ModuleList([
             CrossAttentionProjector(
                 num_student_tokens=num_student_tokens,
                 teacher_dim=teacher_dim,
-                student_dim=teacher_dim,
+                proj_dim=teacher_dim,
                 num_heads=cross_attn_num_heads,
             )
             for _ in self.token_layers
@@ -233,10 +226,8 @@ class BASDLoss(nn.Module):
     def post_step_update(self, loss_info: dict[str, float]) -> None:
         if self.use_gradient_gating:
             for comp in ["rsd", "rel", "attn", "spectral"]:
-                key = f"{comp}_loss"
-                if key in loss_info:
-                    self.schedule.update(comp, loss_info[key])
-        if self.use_lagrangian_reg and "raw_diversity" in loss_info and "raw_recon" in loss_info:
+                self.schedule.update(comp, loss_info[f"{comp}_loss"])
+        if self.use_lagrangian_reg:
             self.lagrangian_reg.update(loss_info["raw_diversity"], loss_info["raw_recon"])
 
     def _avg_per_layer(
@@ -252,7 +243,7 @@ class BASDLoss(nn.Module):
         info: dict[str, float] = {}
         for layer_idx in self.token_layers:
             args = [student_intermediates[layer_idx], aligned_tokens[layer_idx]]
-            if extras is not None and layer_idx in extras:
+            if extras is not None:
                 args.append(extras[layer_idx])
             layer_loss = loss_fn(*args)
             total = total + layer_loss
@@ -266,13 +257,11 @@ class BASDLoss(nn.Module):
         extra_info: dict[str, float],
         raw_losses: dict[str, torch.Tensor],
         loss_info: dict[str, float],
-        global_step: int,
     ) -> None:
         loss_info[f"{name}_loss"] = loss.item()
-        if extra_info:
-            loss_info.update(extra_info)
+        loss_info.update(extra_info)
         if name not in self.disabled_components:
-            ramp = self.schedule.get_ramp(name, global_step) if self.use_gradient_gating else 1.0
+            ramp = self.schedule.get_ramp(name) if self.use_gradient_gating else 1.0
             raw_losses[name] = ramp * loss
 
     def forward(
@@ -283,7 +272,6 @@ class BASDLoss(nn.Module):
         student_attns: dict[int, torch.Tensor],
         all_teacher_tokens: dict[int, torch.Tensor],
         all_teacher_attns: dict[int, torch.Tensor],
-        global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         ce_loss = self.base_criterion(student_output, targets)
 
@@ -305,20 +293,20 @@ class BASDLoss(nn.Module):
         rsd_loss, rsd_dict = self.rsd_loss(
             student_intermediates, aligned_tokens, self.token_layers
         )
-        self._record_component("rsd", rsd_loss, rsd_dict, raw_losses, loss_info, global_step)
+        self._record_component("rsd", rsd_loss, rsd_dict, raw_losses, loss_info)
 
         rel_loss, rel_dict = self._avg_per_layer(
             self.rel_loss, "rel", student_intermediates, aligned_tokens, extras=mixed_attns,
         )
-        self._record_component("rel", rel_loss, rel_dict, raw_losses, loss_info, global_step)
+        self._record_component("rel", rel_loss, rel_dict, raw_losses, loss_info)
 
         attn_loss = self.attn_loss(student_attns, mixed_attns, self.token_layers)
-        self._record_component("attn", attn_loss, {}, raw_losses, loss_info, global_step)
+        self._record_component("attn", attn_loss, {}, raw_losses, loss_info)
 
         spectral_loss, spectral_dict = self._avg_per_layer(
             self.spectral_loss, "spectral", student_intermediates, aligned_tokens,
         )
-        self._record_component("spectral", spectral_loss, spectral_dict, raw_losses, loss_info, global_step)
+        self._record_component("spectral", spectral_loss, spectral_dict, raw_losses, loss_info)
 
         if raw_losses:
             if self.use_scale_invariant_weighting:

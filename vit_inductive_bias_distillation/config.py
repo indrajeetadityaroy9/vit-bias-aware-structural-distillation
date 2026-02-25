@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
 import yaml
 
 
@@ -56,7 +57,6 @@ def load_config(config_path: str | Path) -> Config:
 
 
 def setup_torch_backends() -> None:
-    import torch
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

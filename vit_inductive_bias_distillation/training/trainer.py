@@ -104,7 +104,6 @@ class Trainer:
 
         self._grad_clip_norm = config.training.grad_clip_norm
         self.current_epoch = 0
-        self.global_step = 0
         self.best_val_acc = 0.0
         self.metrics_history: dict[str, list[Any]] = defaultdict(list)
 
@@ -152,7 +151,6 @@ class Trainer:
         custom = torch.load(
             Path(checkpoint_path) / "custom_state.pth",
             map_location=self.device,
-            weights_only=True,
         )
         self.best_val_acc = custom["best_val_acc"]
         self.metrics_history = defaultdict(list, custom["metrics_history"])
@@ -196,9 +194,9 @@ class Trainer:
         total = 0
         batch_count = 0
 
-        for inputs, targets in train_loader:
-            inputs = inputs.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
+        for batch in train_loader:
+            inputs = batch["pixel_values"].to(self.device, non_blocking=True)
+            targets = batch["label"].to(self.device, non_blocking=True)
 
             inputs, mixed_targets = self.mixup_cutmix(inputs, targets)
 
@@ -221,8 +219,6 @@ class Trainer:
             total += targets.size(0)
             batch_count += 1
 
-            self.global_step += 1
-
         return {
             "train_total_loss": total_loss / batch_count,
             "train_acc": 100.0 * correct / total,
@@ -241,10 +237,10 @@ class Trainer:
         total = 0
         batch_count = 0
 
-        for clean_imgs, student_imgs, targets in train_loader:
-            clean_imgs = clean_imgs.to(self.device, non_blocking=True)
-            student_imgs = student_imgs.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
+        for batch in train_loader:
+            clean_imgs = batch["clean"].to(self.device, non_blocking=True)
+            student_imgs = batch["augmented"].to(self.device, non_blocking=True)
+            targets = batch["label"].to(self.device, non_blocking=True)
 
             student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
 
@@ -268,7 +264,6 @@ class Trainer:
                     student_results.attention_weights,
                     teacher_results.all_tokens,
                     teacher_results.all_attentions,
-                    self.global_step,
                 )
 
             self.accelerator.backward(loss)
@@ -292,8 +287,6 @@ class Trainer:
             total += targets.size(0)
             batch_count += 1
 
-            self.global_step += 1
-
         result = {f"train_{k}": v / batch_count for k, v in loss_accum.items()}
         result["train_acc"] = 100.0 * correct / total
         result["total_samples"] = total
@@ -309,6 +302,7 @@ class Trainer:
         start_epoch: int = 0,
     ) -> dict[str, list[Any]]:
         num_epochs = self.config.training.num_epochs
+        epoch = start_epoch
 
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
@@ -373,12 +367,15 @@ class Trainer:
 
         if self.distill:
             def _bn_loader():
-                for clean, _aug, targets in train_loader:
-                    yield clean, targets
+                for batch in train_loader:
+                    yield batch["clean"], batch["label"]
             torch.optim.swa_utils.update_bn(_bn_loader(), self.swa_model, self.device)
         else:
-            torch.optim.swa_utils.update_bn(train_loader, self.swa_model, self.device)
-        self.save_swa_for_eval("best_model.pth", epoch)
+            def _bn_loader():
+                for batch in train_loader:
+                    yield batch["pixel_values"], batch["label"]
+            torch.optim.swa_utils.update_bn(_bn_loader(), self.swa_model, self.device)
+        self.save_swa_for_eval("swa_model.pth", epoch)
         print(f"event=train_complete best_val_acc={self.best_val_acc:.4f}")
 
         return dict(self.metrics_history)

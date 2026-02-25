@@ -20,12 +20,12 @@ class GeometricRelationalLoss(nn.Module):
         self,
         student_tokens: torch.Tensor,
         teacher_tokens: torch.Tensor,
-        teacher_attn: torch.Tensor | None = None,
+        teacher_attn: torch.Tensor,
     ) -> torch.Tensor:
         s = student_tokens.float()
         t = teacher_tokens.float()
 
-        if self.attn_weighted == "weighted" and teacher_attn is not None:
+        if self.attn_weighted == "weighted":
             w = teacher_attn[:, :, 0, 1:].mean(dim=1)
             w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)
             s = w.unsqueeze(-1) * s

@@ -15,6 +15,7 @@ from torchmetrics.classification import (
 
 from vit_inductive_bias_distillation.config import Config, save_config
 from vit_inductive_bias_distillation.data.datasets import (
+    _resolve_channel_stats,
     create_eval_loader,
     get_dataset_info,
     get_subset_indices,
@@ -41,9 +42,9 @@ def evaluate_model(
     total_loss = 0.0
     total = 0
 
-    for inputs, targets in data_loader:
-        inputs = inputs.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    for batch in data_loader:
+        inputs = batch["pixel_values"].to(device, non_blocking=True)
+        targets = batch["label"].to(device, non_blocking=True)
 
         outputs = model(inputs).output
 
@@ -90,14 +91,12 @@ def measure_efficiency(
     dummy_batch = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
     for _ in range(num_warmup):
         model(dummy_batch)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
     start = time.perf_counter()
     for _ in range(num_batches):
         model(dummy_batch)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
     throughput = (batch_size * num_batches) / elapsed
@@ -122,6 +121,8 @@ def evaluate_on_datasets(
     primary_results: dict[str, Any] = {}
     robustness_results: dict[str, Any] = {}
 
+    mean, std = _resolve_channel_stats(config, primary_dataset)
+
     for ds_name in dataset_names:
         info = get_dataset_info(ds_name)
         loader = create_eval_loader(
@@ -129,6 +130,9 @@ def evaluate_on_datasets(
             image_size=config.model.vit.img_size,
             batch_size=config.data.batch_size,
             num_workers=config.data.num_workers,
+            mean=mean,
+            std=std,
+            eval_resize_padding=config.data.eval_resize_padding,
         )
 
         valid_indices = get_subset_indices(ds_name) if "parent_dataset" in info else None
