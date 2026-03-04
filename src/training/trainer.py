@@ -55,7 +55,6 @@ class Trainer:
         student_info: dict | None = None,
     ):
         self.accelerator = accelerator
-        self.device = accelerator.device
         self.config = config
         self.distill = teacher is not None
 
@@ -87,7 +86,7 @@ class Trainer:
                 teacher_heads_per_layer=teacher_heads,
                 teacher_has_cls_token=teacher.has_cls_token,
                 teacher_feature_format=teacher.feature_format,
-            ).to(self.device)
+            ).cuda()
 
             self.optimizer.add_param_group({
                 "params": list(self.basd_loss.parameters()),
@@ -134,7 +133,7 @@ class Trainer:
 
         custom = torch.load(
             Path(checkpoint_path) / "custom_state.pth",
-            map_location=self.device,
+            map_location="cuda",
             weights_only=True,
         )
         self.best_val_acc = custom["best_val_acc"]
@@ -150,8 +149,8 @@ class Trainer:
         total = 0
 
         for batch in train_loader:
-            inputs = batch["pixel_values"].to(self.device)
-            targets = batch["label"].to(self.device)
+            inputs = batch["pixel_values"].cuda()
+            targets = batch["label"].cuda()
 
             inputs, mixed_targets = self.mixup_cutmix(inputs, targets)
 
@@ -183,9 +182,9 @@ class Trainer:
         total = 0
 
         for batch in train_loader:
-            clean_imgs = batch["clean"].to(self.device)
-            student_imgs = batch["augmented"].to(self.device)
-            targets = batch["label"].to(self.device)
+            clean_imgs = batch["clean"].cuda()
+            student_imgs = batch["augmented"].cuda()
+            targets = batch["label"].cuda()
 
             student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
 
@@ -243,7 +242,7 @@ class Trainer:
 
             self.optimizer.eval()
             val_metrics = evaluate_model(
-                self.model, val_loader, self.device,
+                self.model, val_loader,
                 criterion=self.criterion,
                 num_classes=self.config.model.num_classes,
             )

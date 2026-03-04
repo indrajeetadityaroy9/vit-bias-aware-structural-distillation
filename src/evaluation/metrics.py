@@ -20,7 +20,6 @@ from src.data.datasets import (
 def evaluate_model(
     model: nn.Module,
     data_loader: torch.utils.data.DataLoader,
-    device: torch.device,
     criterion: nn.Module,
     *,
     num_classes: int,
@@ -28,15 +27,15 @@ def evaluate_model(
 ) -> dict[str, Any]:
     model.eval()
 
-    acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").to(device)
-    acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro").to(device)
+    acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").cuda()
+    acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro").cuda()
 
     total_loss = 0.0
     total = 0
 
     for batch in data_loader:
-        inputs = batch["pixel_values"].to(device)
-        targets = batch["label"].to(device)
+        inputs = batch["pixel_values"].cuda()
+        targets = batch["label"].cuda()
 
         outputs = model(inputs)
 
@@ -59,7 +58,6 @@ def evaluate_model(
 @torch.no_grad()
 def measure_efficiency(
     model: nn.Module,
-    device: torch.device,
     *,
     image_size: int,
     in_channels: int = 3,
@@ -72,13 +70,13 @@ def measure_efficiency(
     param_count = sum(p.numel() for p in model.parameters())
     param_count_m = param_count / 1e6
 
-    dummy = torch.randn(1, in_channels, image_size, image_size, device=device)
+    dummy = torch.randn(1, in_channels, image_size, image_size, device="cuda")
     flop_counter = FlopCounterMode(display=False)
     with flop_counter:
         model(dummy)
     gflops = flop_counter.get_total_flops() / 1e9
 
-    dummy_batch = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
+    dummy_batch = torch.randn(batch_size, in_channels, image_size, image_size, device="cuda")
     for _ in range(num_warmup):
         model(dummy_batch)
     torch.cuda.synchronize()
@@ -102,7 +100,6 @@ def measure_efficiency(
 def run_eval_suite(
     model: nn.Module,
     config,
-    device: torch.device,
     *,
     config_path: str,
 ) -> dict[str, Any]:
@@ -130,7 +127,7 @@ def run_eval_suite(
         num_classes = len(valid_indices) if valid_indices is not None else primary_num_classes
 
         metrics = evaluate_model(
-            model, loader, device, criterion,
+            model, loader, criterion,
             num_classes=num_classes, valid_indices=valid_indices,
         )
 
@@ -146,7 +143,7 @@ def run_eval_suite(
         )
 
     efficiency = measure_efficiency(
-        model, device,
+        model,
         image_size=config.model.vit.img_size,
     )
 

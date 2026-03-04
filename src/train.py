@@ -38,7 +38,6 @@ def _create_student(
     num_classes: int,
     drop_path_rate: float,
     img_size: int,
-    device: torch.device,
     arch_overrides: dict | None = None,
 ) -> nn.Module:
     kwargs = dict(
@@ -52,7 +51,7 @@ def _create_student(
     model = timm.create_model(model_name, **kwargs)
     _apply_fan_in_init(model)
     model.set_grad_checkpointing(True)
-    return model.to(device)
+    return model.cuda()
 
 
 def _derive_from_teacher(teacher: TeacherModel, intrinsic_dim: int) -> dict:
@@ -92,14 +91,13 @@ def main(config: DictConfig) -> None:
             num_classes=config.model.num_classes,
             drop_path_rate=config.model.drop_path_rate,
             img_size=img_size,
-            device=accelerator.device,
         )
 
         train_loader, val_loader = create_dataloaders(config, view_mode="single")
         trainer = Trainer(student, config, accelerator=accelerator)
     else:
         teacher = load_teacher(
-            config.basd.teacher_model_name, accelerator.device, img_size=img_size,
+            config.basd.teacher_model_name, img_size=img_size,
         )
 
         if teacher.feature_format == "token":
@@ -116,7 +114,7 @@ def main(config: DictConfig) -> None:
             ).take(num_calib)
             calib_images = torch.stack([
                 calib_tf(ex[ds_info["image_key"]].convert("RGB")) for ex in calib_ds
-            ]).to(accelerator.device)
+            ]).cuda()
 
             intrinsic_dim = estimate_intrinsic_dim(teacher, calib_images)
             arch_overrides = _derive_from_teacher(teacher, intrinsic_dim)
@@ -138,11 +136,10 @@ def main(config: DictConfig) -> None:
             num_classes=config.model.num_classes,
             drop_path_rate=config.model.drop_path_rate,
             img_size=img_size,
-            device=accelerator.device,
             arch_overrides=arch_overrides,
         )
 
-        student_info = probe_model(student, accelerator.device, img_size)
+        student_info = probe_model(student, img_size)
         print(
             f"student_probed embed_dim={student_info['embed_dim']} "
             f"depth={student_info['depth']} num_tokens={student_info['num_tokens']} "
@@ -171,7 +168,7 @@ def main(config: DictConfig) -> None:
     trainer.optimizer.eval()
     model = accelerator.unwrap_model(trainer.model)
     results = run_eval_suite(
-        model, config, accelerator.device,
+        model, config,
         config_path=str(output_dir / "config.yaml"),
     )
 

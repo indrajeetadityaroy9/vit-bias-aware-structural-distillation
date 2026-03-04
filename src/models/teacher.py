@@ -39,7 +39,7 @@ def make_attn_capture_hook(
     return hook
 
 
-def probe_model(model: nn.Module, device: torch.device, img_size: int) -> dict:
+def probe_model(model: nn.Module, img_size: int) -> dict:
     embed_dim = getattr(model, 'embed_dim', None) or getattr(model, 'num_features', None)
 
     layer_paths = []
@@ -77,7 +77,7 @@ def probe_model(model: nn.Module, device: torch.device, img_size: int) -> dict:
 
     has_cls_token = any(n == 'cls_token' for n, _ in model.named_parameters())
 
-    probe = torch.zeros(1, 3, img_size, img_size, device=device)
+    probe = torch.zeros(1, 3, img_size, img_size, device="cuda")
     num_tokens = 0
     with torch.no_grad():
         captured = {}
@@ -110,8 +110,7 @@ def probe_model(model: nn.Module, device: torch.device, img_size: int) -> dict:
     }
 
 
-def load_teacher(model_name: str, device: torch.device,
-                 img_size: int) -> TeacherModel:
+def load_teacher(model_name: str, img_size: int) -> TeacherModel:
     if model_name.startswith("dinov2_"):
         model = torch.hub.load("facebookresearch/dinov2", model_name)
         mean, std = _IMAGENET_MEAN, _IMAGENET_STD
@@ -120,11 +119,11 @@ def load_teacher(model_name: str, device: torch.device,
         cfg = model.pretrained_cfg
         mean, std = tuple(cfg['mean']), tuple(cfg['std'])
 
-    model = model.to(device).eval()
+    model = model.cuda().eval()
     for param in model.parameters():
         param.requires_grad = False
 
-    info = probe_model(model, device, img_size)
+    info = probe_model(model, img_size)
 
     print(
         f"teacher_loaded model={model_name} embed_dim={info['embed_dim']} "

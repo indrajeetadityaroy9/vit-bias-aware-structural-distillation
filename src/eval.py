@@ -3,7 +3,6 @@ from pathlib import Path
 import hydra
 import timm
 import torch
-from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 
 from src.evaluation.metrics import run_eval_suite, save_metrics
@@ -21,17 +20,15 @@ def main(config: DictConfig) -> None:
 
     torch.manual_seed(config.run.seed)
 
-    accelerator = Accelerator()
-
     kwargs = dict(
         pretrained=False,
         num_classes=config.model.num_classes,
         img_size=config.model.vit.img_size,
         **OmegaConf.to_container(config.model.arch_overrides, resolve=True),
     )
-    model = timm.create_model(config.model.student_preset, **kwargs).to(accelerator.device)
+    model = timm.create_model(config.model.student_preset, **kwargs).cuda()
 
-    ckpt = torch.load(config.checkpoint.path, map_location=accelerator.device, weights_only=True)
+    ckpt = torch.load(config.checkpoint.path, map_location="cuda", weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"checkpoint_loaded path={config.checkpoint.path} epoch={ckpt['epoch']}")
 
@@ -39,7 +36,7 @@ def main(config: DictConfig) -> None:
     OmegaConf.save(config, output_dir / "config.yaml")
 
     results = run_eval_suite(
-        model, config, accelerator.device,
+        model, config,
         config_path=str(output_dir / "config.yaml"),
     )
 
