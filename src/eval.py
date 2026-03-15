@@ -13,7 +13,6 @@ register_resolvers()
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
-    assert torch.cuda.is_available(), "CUDA required"
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 

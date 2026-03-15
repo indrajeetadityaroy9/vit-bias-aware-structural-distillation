@@ -10,17 +10,16 @@ from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
 from src.evaluation.metrics import evaluate_model
 from src.losses.combined import BASDLoss
-from src.models.teacher import TeacherModel, extract_intermediates, make_attn_capture_hook
+from src.models.teacher import TeacherModel, extract_intermediates
 
 
 @torch.compiler.disable
 def _extract_student(
     model: nn.Module, x: torch.Tensor, layer_indices: list[int],
-    *, layer_paths: list[str], attn_subpath: str | None, has_cls_token: bool,
-) -> tuple[torch.Tensor, dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    *, layer_paths: list[str], has_cls_token: bool,
+) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
     hooks = []
     captured_tokens = {}
-    captured_attns = {}
 
     for idx in layer_indices:
         block = model.get_submodule(layer_paths[idx])
@@ -31,17 +30,11 @@ def _extract_student(
             return hook
         hooks.append(block.register_forward_hook(make_token_hook(idx)))
 
-        if attn_subpath is not None:
-            attn_mod = model.get_submodule(f"{layer_paths[idx]}.{attn_subpath}")
-            hooks.append(attn_mod.register_forward_hook(
-                make_attn_capture_hook(captured_attns, idx, apply_softmax=False)
-            ))
-
     logits = model(x)
     for h in hooks:
         h.remove()
 
-    return logits, captured_tokens, captured_attns
+    return logits, captured_tokens
 
 
 class Trainer:
@@ -66,11 +59,7 @@ class Trainer:
 
         self._teacher = teacher
         self._student_layer_paths = student_info['layer_paths']
-        self._student_attn_subpath = student_info['attn_subpath']
         self._student_has_cls = student_info['has_cls_token']
-
-        student_heads = student_info['heads_per_layer']
-        teacher_heads = teacher.heads_per_layer
 
         self.basd_loss = BASDLoss(
             base_criterion=self.criterion,
@@ -78,12 +67,8 @@ class Trainer:
             teacher_dim=teacher.embed_dim,
             student_depth=student_info['depth'],
             num_student_tokens=student_info['num_tokens'],
-            cross_attn_num_heads=teacher.heads_per_layer[0],
             config=config.basd,
-            student_heads_per_layer=student_heads,
-            teacher_heads_per_layer=teacher_heads,
             teacher_has_cls_token=teacher.has_cls_token,
-            teacher_feature_format=teacher.feature_format,
         ).cuda()
 
         self.optimizer.add_param_group({
@@ -153,10 +138,9 @@ class Trainer:
             student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
 
             with self.accelerator.autocast():
-                student_logits, s_tokens, s_attns = _extract_student(
+                student_logits, s_tokens = _extract_student(
                     self.model, student_imgs, self.basd_loss.token_layers,
                     layer_paths=self._student_layer_paths,
-                    attn_subpath=self._student_attn_subpath,
                     has_cls_token=self._student_has_cls,
                 )
 
@@ -166,14 +150,12 @@ class Trainer:
                     student_logits,
                     mixed_targets,
                     s_tokens,
-                    s_attns,
                     teacher_tokens,
                     teacher_attns,
                 )
 
             self.accelerator.backward(loss)
             self.optimizer.step()
-            self.basd_loss.project_to_stiefel()
             self.optimizer.zero_grad()
 
             n = targets.size(0)

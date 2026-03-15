@@ -18,31 +18,27 @@ from torchvision.transforms.v2 import (
 
 
 _NUM_WORKERS = 8
+_CHANNEL_STATS_SAMPLES = 5000
 
 
 @lru_cache(maxsize=None)
 def dataset_info(dataset_name: str) -> dict:
     builder = load_dataset_builder(dataset_name, trust_remote_code=True)
     features = builder.info.features
-    available_splits = set(builder.info.splits.keys())
+    splits = set(builder.info.splits.keys())
 
     image_key = next(n for n, f in features.items() if isinstance(f, Image))
     label_key = next(n for n, f in features.items() if isinstance(f, ClassLabel))
     feat = features[label_key]
 
-    train_split = "train" if "train" in available_splits else None
-    eval_split = (
-        "validation" if "validation" in available_splits
-        else "test" if "test" in available_splits
-        else "train"
-    )
+    eval_split = "validation" if "validation" in splits else "test" if "test" in splits else "train"
 
     return {
         "image_key": image_key,
         "label_key": label_key,
         "num_classes": feat.num_classes,
         "class_names": tuple(feat.names),
-        "train_split": train_split,
+        "train_split": "train",
         "eval_split": eval_split,
     }
 
@@ -50,7 +46,7 @@ def dataset_info(dataset_name: str) -> dict:
 @lru_cache(maxsize=None)
 def get_channel_stats(dataset_name: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
     info = dataset_info(dataset_name)
-    ds = load_dataset(dataset_name, split=info["train_split"], streaming=True, trust_remote_code=True).take(5000)
+    ds = load_dataset(dataset_name, split=info["train_split"], streaming=True, trust_remote_code=True).take(_CHANNEL_STATS_SAMPLES)
 
     mean = np.zeros(3, dtype=np.float64)
     m2 = np.zeros(3, dtype=np.float64)

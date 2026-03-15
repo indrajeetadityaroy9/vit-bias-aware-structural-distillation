@@ -6,12 +6,6 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def _retract_to_stiefel(linear: nn.Linear) -> None:
-    U, _, Vt = torch.linalg.svd(linear.weight, full_matrices=False)
-    linear.weight.copy_(U @ Vt)
-
-
-@torch.no_grad()
 def marchenko_pastur_rank(features: torch.Tensor) -> int:
     M, D = features.shape
     q = D / M
@@ -30,11 +24,17 @@ def _grassmann_subspace(
     z_flat: torch.Tensor,
     *,
     k: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract top-k PCA subspace and corresponding singular values.
+
+    Returns:
+        basis: (D, k) orthonormal basis of the top-k subspace
+        svals: (k,) singular values (spectral importance weights)
+    """
     z = z_flat.float()
     z = z - z.mean(dim=0, keepdim=True)
-    _, _, Vt = torch.linalg.svd(z, full_matrices=False)
-    return Vt[:k].T
+    _, S, Vt = torch.linalg.svd(z, full_matrices=False)
+    return Vt[:k].T, S[:k]
 
 
 class GrassmannianLayerSelector(nn.Module):
@@ -47,7 +47,6 @@ class GrassmannianLayerSelector(nn.Module):
         super().__init__()
         self.student_dim = student_dim
         self.subspace_ranks: dict[int, int] = {}
-        self._rank_calibrated = False
 
         proj_s = torch.empty(student_dim, student_dim)
         proj_t = torch.empty(student_dim, teacher_dim)
@@ -67,15 +66,12 @@ class GrassmannianLayerSelector(nn.Module):
     def temperatures(self) -> torch.Tensor:
         return F.softplus(self.log_temperatures)
 
-    def _calibrate_rank(self, all_teacher_tokens: dict[int, torch.Tensor]) -> None:
-        if self._rank_calibrated:
-            return
-        with torch.no_grad():
-            for idx, tokens in all_teacher_tokens.items():
-                sample_z = tokens.reshape(-1, tokens.shape[2]) @ self.proj_t.T
-                auto_rank = marchenko_pastur_rank(sample_z)
-                self.subspace_ranks[idx] = min(auto_rank, self.student_dim - 1)
-        self._rank_calibrated = True
+    @torch.no_grad()
+    def _estimate_ranks(self, all_teacher_tokens: dict[int, torch.Tensor]) -> None:
+        for idx, tokens in all_teacher_tokens.items():
+            sample_z = tokens.reshape(-1, tokens.shape[2]) @ self.proj_t.T
+            auto_rank = marchenko_pastur_rank(sample_z)
+            self.subspace_ranks[idx] = min(auto_rank, self.student_dim - 1)
 
     def _mix_for_student_layer(
         self,
@@ -85,6 +81,7 @@ class GrassmannianLayerSelector(nn.Module):
         stacked_tokens: torch.Tensor,
         stacked_attns: torch.Tensor,
         subspaces: dict[int, torch.Tensor],
+        spectral_weights: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         D_s = s_tokens.shape[2]
         s_flat = s_tokens.reshape(-1, D_s)
@@ -101,7 +98,11 @@ class GrassmannianLayerSelector(nn.Module):
             U_t = subspaces[t_idx]
             sigma = torch.linalg.svdvals(U_s.T @ U_t)
             theta = torch.acos(sigma.clamp(max=1.0 - torch.finfo(sigma.dtype).eps))
-            d_grass_sq[j] = theta.pow(2).sum() / k
+
+            # Spectrally-weighted Grassmannian distance: high-energy
+            # directions contribute more to the layer matching decision.
+            sw = spectral_weights[t_idx]
+            d_grass_sq[j] = (sw * theta.pow(2)).sum() / sw.sum()
 
         tau = self.temperatures[i]
         weights = F.softmax(-d_grass_sq / tau, dim=0)
@@ -121,17 +122,20 @@ class GrassmannianLayerSelector(nn.Module):
     ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         teacher_indices = sorted(all_teacher_tokens.keys())
 
-        self._calibrate_rank(all_teacher_tokens)
+        self._estimate_ranks(all_teacher_tokens)
 
         D_t = all_teacher_tokens[teacher_indices[0]].shape[2]
         stacked_tokens = torch.stack([all_teacher_tokens[idx] for idx in teacher_indices])
         stacked_attns = torch.stack([all_teacher_attns[idx] for idx in teacher_indices])
 
         subspaces = {}
+        spectral_weights = {}
         with torch.no_grad():
             for idx in teacher_indices:
                 z_t = all_teacher_tokens[idx].reshape(-1, D_t) @ self.proj_t.T
-                subspaces[idx] = _grassmann_subspace(z_t, k=self.subspace_ranks[idx])
+                basis, svals = _grassmann_subspace(z_t, k=self.subspace_ranks[idx])
+                subspaces[idx] = basis
+                spectral_weights[idx] = svals
 
         mixed_teachers = {}
         mixed_attentions = {}
@@ -139,7 +143,8 @@ class GrassmannianLayerSelector(nn.Module):
         for i, s_layer in enumerate(extraction_indices):
             mixed, attn = self._mix_for_student_layer(
                 i, student_tokens_per_layer[s_layer],
-                teacher_indices, stacked_tokens, stacked_attns, subspaces,
+                teacher_indices, stacked_tokens, stacked_attns,
+                subspaces, spectral_weights,
             )
             mixed_teachers[s_layer] = mixed
             mixed_attentions[s_layer] = attn
