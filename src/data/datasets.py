@@ -1,4 +1,4 @@
-from typing import Literal
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -20,8 +20,9 @@ from torchvision.transforms.v2 import (
 _NUM_WORKERS = 8
 
 
+@lru_cache(maxsize=None)
 def dataset_info(dataset_name: str) -> dict:
-    builder = load_dataset_builder(dataset_name)
+    builder = load_dataset_builder(dataset_name, trust_remote_code=True)
     features = builder.info.features
     available_splits = set(builder.info.splits.keys())
 
@@ -46,9 +47,10 @@ def dataset_info(dataset_name: str) -> dict:
     }
 
 
+@lru_cache(maxsize=None)
 def get_channel_stats(dataset_name: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
     info = dataset_info(dataset_name)
-    ds = load_dataset(dataset_name, split=info["train_split"], streaming=True).take(5000)
+    ds = load_dataset(dataset_name, split=info["train_split"], streaming=True, trust_remote_code=True).take(5000)
 
     mean = np.zeros(3, dtype=np.float64)
     m2 = np.zeros(3, dtype=np.float64)
@@ -109,7 +111,7 @@ def create_eval_loader(
     transform = build_eval_transform(image_size, mean=mean, std=std, crop_ratio=crop_ratio)
     image_key, label_key = info["image_key"], info["label_key"]
 
-    ds = load_dataset(dataset_name, split=info["eval_split"])
+    ds = load_dataset(dataset_name, split=info["eval_split"], trust_remote_code=True)
     ds.set_transform(lambda ex: {
         "pixel_values": [transform(img.convert("RGB")) for img in ex[image_key]],
         "label": ex[label_key],
@@ -128,8 +130,7 @@ def create_eval_loader(
 def create_dataloaders(
     config,
     *,
-    view_mode: Literal["dual", "single"],
-    teacher_stats: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
+    teacher_stats: tuple[tuple[float, ...], tuple[float, ...]],
 ) -> tuple[DataLoader, DataLoader]:
     info = dataset_info(config.data.dataset)
     mean, std = get_channel_stats(config.data.dataset)
@@ -146,23 +147,17 @@ def create_dataloaders(
         Normalize(mean, std),
     ])
 
-    train_ds = load_dataset(config.data.dataset, split=info["train_split"])
+    teacher_mean, teacher_std = teacher_stats
+    clean_tf = build_eval_transform(
+        image_size, mean=teacher_mean, std=teacher_std, crop_ratio=crop_ratio,
+    )
 
-    if view_mode == "dual":
-        teacher_mean, teacher_std = teacher_stats
-        clean_tf = build_eval_transform(
-            image_size, mean=teacher_mean, std=teacher_std, crop_ratio=crop_ratio,
-        )
-        train_ds.set_transform(lambda ex: {
-            "clean": [clean_tf(img.convert("RGB")) for img in ex[image_key]],
-            "augmented": [aug_tf(img.convert("RGB")) for img in ex[image_key]],
-            "label": ex[label_key],
-        })
-    else:
-        train_ds.set_transform(lambda ex: {
-            "pixel_values": [aug_tf(img.convert("RGB")) for img in ex[image_key]],
-            "label": ex[label_key],
-        })
+    train_ds = load_dataset(config.data.dataset, split=info["train_split"], trust_remote_code=True)
+    train_ds.set_transform(lambda ex: {
+        "clean": [clean_tf(img.convert("RGB")) for img in ex[image_key]],
+        "augmented": [aug_tf(img.convert("RGB")) for img in ex[image_key]],
+        "label": ex[label_key],
+    })
 
     train_loader = DataLoader(
         train_ds,

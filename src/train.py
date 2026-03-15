@@ -71,9 +71,8 @@ register_resolvers()
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
+    assert torch.cuda.is_available(), "CUDA required"
     torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
     torch.manual_seed(config.run.seed)
@@ -85,77 +84,64 @@ def main(config: DictConfig) -> None:
 
     img_size = config.model.vit.img_size
 
-    if config.training.mode == "baseline":
-        student = _create_student(
-            config.model.student_preset,
-            num_classes=config.model.num_classes,
-            drop_path_rate=config.model.drop_path_rate,
-            img_size=img_size,
+    teacher = load_teacher(config.basd.teacher_model_name, img_size=img_size)
+
+    if teacher.feature_format == "token":
+        ds_info = dataset_info(config.data.dataset)
+        calib_tf = build_eval_transform(
+            img_size, mean=teacher.mean, std=teacher.std,
+            crop_ratio=config.data.eval_crop_ratio,
         )
+        tokens_per_image = (img_size // config.model.vit.patch_size) ** 2
+        num_calib = math.ceil(10 * teacher.embed_dim / tokens_per_image)
 
-        train_loader, val_loader = create_dataloaders(config, view_mode="single")
-        trainer = Trainer(student, config, accelerator=accelerator)
-    else:
-        teacher = load_teacher(
-            config.basd.teacher_model_name, img_size=img_size,
-        )
+        calib_ds = hf_load_dataset(
+            config.data.dataset, split=ds_info["train_split"],
+            streaming=True, trust_remote_code=True,
+        ).take(num_calib)
+        calib_images = torch.stack([
+            calib_tf(ex[ds_info["image_key"]].convert("RGB")) for ex in calib_ds
+        ]).cuda()
 
-        if teacher.feature_format == "token":
-            ds_info = dataset_info(config.data.dataset)
-            calib_tf = build_eval_transform(
-                img_size, mean=teacher.mean, std=teacher.std,
-                crop_ratio=config.data.eval_crop_ratio,
-            )
-            tokens_per_image = (img_size // config.model.vit.patch_size) ** 2
-            num_calib = math.ceil(10 * teacher.embed_dim / tokens_per_image)
-
-            calib_ds = hf_load_dataset(
-                config.data.dataset, split=ds_info["train_split"], streaming=True,
-            ).take(num_calib)
-            calib_images = torch.stack([
-                calib_tf(ex[ds_info["image_key"]].convert("RGB")) for ex in calib_ds
-            ]).cuda()
-
-            intrinsic_dim = estimate_intrinsic_dim(teacher, calib_images)
-            arch_overrides = _derive_from_teacher(teacher, intrinsic_dim)
-            print(
-                f"student_arch_derived intrinsic_dim={intrinsic_dim} "
-                f"embed_dim={arch_overrides['embed_dim']} "
-                f"depth={arch_overrides['depth']} num_heads={arch_overrides['num_heads']} "
-                f"mlp_ratio={arch_overrides['mlp_ratio']:.1f}"
-            )
-        else:
-            arch_overrides = None
-
-        if arch_overrides:
-            with open_dict(config):
-                config.model.arch_overrides = arch_overrides
-
-        student = _create_student(
-            config.model.student_preset,
-            num_classes=config.model.num_classes,
-            drop_path_rate=config.model.drop_path_rate,
-            img_size=img_size,
-            arch_overrides=arch_overrides,
-        )
-
-        student_info = probe_model(student, img_size)
+        intrinsic_dim = estimate_intrinsic_dim(teacher, calib_images)
+        arch_overrides = _derive_from_teacher(teacher, intrinsic_dim)
         print(
-            f"student_probed embed_dim={student_info['embed_dim']} "
-            f"depth={student_info['depth']} num_tokens={student_info['num_tokens']} "
-            f"heads_per_layer={student_info['heads_per_layer']} "
-            f"has_cls={student_info['has_cls_token']} "
-            f"attn_subpath={student_info['attn_subpath']}"
+            f"student_arch_derived intrinsic_dim={intrinsic_dim} "
+            f"embed_dim={arch_overrides['embed_dim']} "
+            f"depth={arch_overrides['depth']} num_heads={arch_overrides['num_heads']} "
+            f"mlp_ratio={arch_overrides['mlp_ratio']:.1f}"
         )
+    else:
+        arch_overrides = None
 
-        train_loader, val_loader = create_dataloaders(
-            config, view_mode="dual",
-            teacher_stats=(teacher.mean, teacher.std),
-        )
-        trainer = Trainer(
-            student, config, accelerator=accelerator,
-            teacher=teacher, student_info=student_info,
-        )
+    if arch_overrides:
+        with open_dict(config):
+            config.model.arch_overrides = arch_overrides
+
+    student = _create_student(
+        config.model.student_preset,
+        num_classes=config.model.num_classes,
+        drop_path_rate=config.model.drop_path_rate,
+        img_size=img_size,
+        arch_overrides=arch_overrides,
+    )
+
+    student_info = probe_model(student, img_size)
+    print(
+        f"student_probed embed_dim={student_info['embed_dim']} "
+        f"depth={student_info['depth']} num_tokens={student_info['num_tokens']} "
+        f"heads_per_layer={student_info['heads_per_layer']} "
+        f"has_cls={student_info['has_cls_token']} "
+        f"attn_subpath={student_info['attn_subpath']}"
+    )
+
+    train_loader, val_loader = create_dataloaders(
+        config, teacher_stats=(teacher.mean, teacher.std),
+    )
+    trainer = Trainer(
+        student, config, accelerator=accelerator,
+        teacher=teacher, student_info=student_info,
+    )
 
     OmegaConf.save(config, output_dir / "config.yaml")
 

@@ -45,6 +45,6 @@ def geometric_relational_loss(
     tr_s = (s_w * s_w).sum(dim=(1, 2))
     tr_t = (t_w * t_w).sum(dim=(1, 2))
     cross = torch.bmm(s_w.transpose(1, 2), t_w)
-    nuclear = torch.linalg.svdvals(cross).sum(dim=-1)
+    nuclear = torch.linalg.matrix_norm(cross, ord="nuc")
 
     return (tr_s + tr_t - 2.0 * nuclear).mean()

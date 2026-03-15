@@ -112,7 +112,7 @@ def probe_model(model: nn.Module, img_size: int) -> dict:
 
 def load_teacher(model_name: str, img_size: int) -> TeacherModel:
     if model_name.startswith("dinov2_"):
-        model = torch.hub.load("facebookresearch/dinov2", model_name)
+        model = torch.hub.load("facebookresearch/dinov2", model_name, trust_repo=True)
         mean, std = _IMAGENET_MEAN, _IMAGENET_STD
     else:
         model = timm.create_model(model_name, pretrained=True, num_classes=0)

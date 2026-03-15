@@ -29,7 +29,6 @@ checkpoint:
   path: null
 
 training:
-  mode: distill
   num_epochs: 300
   learning_rate: 1.0e-3
   weight_decay: 0.05

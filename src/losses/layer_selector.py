@@ -33,10 +33,8 @@ def _grassmann_subspace(
 ) -> torch.Tensor:
     z = z_flat.float()
     z = z - z.mean(dim=0, keepdim=True)
-    M = z.shape[0]
-    cov = z.T @ z / M
-    _, eigvecs = torch.linalg.eigh(cov)
-    return eigvecs[:, -k:]
+    _, _, Vt = torch.linalg.svd(z, full_matrices=False)
+    return Vt[:k].T
 
 
 class GrassmannianLayerSelector(nn.Module):
@@ -94,14 +92,12 @@ class GrassmannianLayerSelector(nn.Module):
 
         z_s_c = z_s.float()
         z_s_c = z_s_c - z_s_c.mean(dim=0, keepdim=True)
-        M_s = z_s_c.shape[0]
-        cov_s = z_s_c.T @ z_s_c / M_s
-        _, all_student_eigvecs = torch.linalg.eigh(cov_s)
+        _, _, Vt_s = torch.linalg.svd(z_s_c, full_matrices=False)
 
         d_grass_sq = torch.zeros(len(teacher_indices), device=stacked_tokens.device)
         for j, t_idx in enumerate(teacher_indices):
             k = self.subspace_ranks[t_idx]
-            U_s = all_student_eigvecs[:, -k:]
+            U_s = Vt_s[:k].T
             U_t = subspaces[t_idx]
             sigma = torch.linalg.svdvals(U_s.T @ U_t)
             theta = torch.acos(sigma.clamp(max=1.0 - torch.finfo(sigma.dtype).eps))

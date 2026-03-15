@@ -50,13 +50,12 @@ class Trainer:
         student_model: nn.Module,
         config,
         accelerator: Accelerator,
-        teacher: TeacherModel | None = None,
+        teacher: TeacherModel,
         *,
-        student_info: dict | None = None,
+        student_info: dict,
     ):
         self.accelerator = accelerator
         self.config = config
-        self.distill = teacher is not None
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
         self.optimizer = AdamWScheduleFree(
@@ -65,32 +64,31 @@ class Trainer:
             weight_decay=config.training.weight_decay,
         )
 
-        if self.distill:
-            self._teacher = teacher
-            self._student_layer_paths = student_info['layer_paths']
-            self._student_attn_subpath = student_info['attn_subpath']
-            self._student_has_cls = student_info['has_cls_token']
+        self._teacher = teacher
+        self._student_layer_paths = student_info['layer_paths']
+        self._student_attn_subpath = student_info['attn_subpath']
+        self._student_has_cls = student_info['has_cls_token']
 
-            student_heads = student_info['heads_per_layer']
-            teacher_heads = teacher.heads_per_layer
+        student_heads = student_info['heads_per_layer']
+        teacher_heads = teacher.heads_per_layer
 
-            self.basd_loss = BASDLoss(
-                base_criterion=self.criterion,
-                student_dim=student_info['embed_dim'],
-                teacher_dim=teacher.embed_dim,
-                student_depth=student_info['depth'],
-                num_student_tokens=student_info['num_tokens'],
-                cross_attn_num_heads=teacher.heads_per_layer[0],
-                config=config.basd,
-                student_heads_per_layer=student_heads,
-                teacher_heads_per_layer=teacher_heads,
-                teacher_has_cls_token=teacher.has_cls_token,
-                teacher_feature_format=teacher.feature_format,
-            ).cuda()
+        self.basd_loss = BASDLoss(
+            base_criterion=self.criterion,
+            student_dim=student_info['embed_dim'],
+            teacher_dim=teacher.embed_dim,
+            student_depth=student_info['depth'],
+            num_student_tokens=student_info['num_tokens'],
+            cross_attn_num_heads=teacher.heads_per_layer[0],
+            config=config.basd,
+            student_heads_per_layer=student_heads,
+            teacher_heads_per_layer=teacher_heads,
+            teacher_has_cls_token=teacher.has_cls_token,
+            teacher_feature_format=teacher.feature_format,
+        ).cuda()
 
-            self.optimizer.add_param_group({
-                "params": list(self.basd_loss.parameters()),
-            })
+        self.optimizer.add_param_group({
+            "params": list(self.basd_loss.parameters()),
+        })
 
         student_model = torch.compile(student_model, mode="max-autotune")
 
@@ -98,8 +96,7 @@ class Trainer:
             student_model, self.optimizer
         )
 
-        if self.distill:
-            accelerator.register_for_checkpointing(self.basd_loss)
+        accelerator.register_for_checkpointing(self.basd_loss)
 
         self.best_val_acc = 0.0
         self.metrics_history = defaultdict(list)
@@ -140,51 +137,18 @@ class Trainer:
         self.metrics_history = defaultdict(list, custom["metrics_history"])
         return custom["epoch"] + 1
 
-    def _train_epoch_baseline(
+    def _train_epoch(
         self,
         train_loader: torch.utils.data.DataLoader,
     ) -> dict[str, float]:
-        total_loss = 0.0
-        correct = 0
+        total_loss = torch.tensor(0.0, device="cuda")
+        correct = torch.tensor(0, device="cuda", dtype=torch.long)
         total = 0
 
         for batch in train_loader:
-            inputs = batch["pixel_values"].cuda()
-            targets = batch["label"].cuda()
-
-            inputs, mixed_targets = self.mixup_cutmix(inputs, targets)
-
-            with self.accelerator.autocast():
-                logits = self.model(inputs)
-                loss = self.criterion(logits, mixed_targets)
-
-            self.accelerator.backward(loss)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            n = targets.size(0)
-            total_loss += loss.item() * n
-            predicted = logits.argmax(1)
-            correct += predicted.eq(targets).sum().item()
-            total += n
-
-        return {
-            "train_loss": total_loss / total,
-            "train_acc": 100.0 * correct / total,
-        }
-
-    def _train_epoch_distill(
-        self,
-        train_loader: torch.utils.data.DataLoader,
-    ) -> dict[str, float]:
-        total_loss = 0.0
-        correct = 0
-        total = 0
-
-        for batch in train_loader:
-            clean_imgs = batch["clean"].cuda()
-            student_imgs = batch["augmented"].cuda()
-            targets = batch["label"].cuda()
+            clean_imgs = batch["clean"].cuda(non_blocking=True)
+            student_imgs = batch["augmented"].cuda(non_blocking=True)
+            targets = batch["label"].cuda(non_blocking=True)
 
             student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
 
@@ -213,14 +177,13 @@ class Trainer:
             self.optimizer.zero_grad()
 
             n = targets.size(0)
-            total_loss += loss.item() * n
-            predicted = student_logits.argmax(1)
-            correct += predicted.eq(targets).sum().item()
+            total_loss += loss.detach() * n
+            correct += student_logits.detach().argmax(1).eq(targets).sum()
             total += n
 
         return {
-            "train_loss": total_loss / total,
-            "train_acc": 100.0 * correct / total,
+            "train_loss": (total_loss / total).item(),
+            "train_acc": 100.0 * (correct / total).item(),
         }
 
     def train(
@@ -230,15 +193,11 @@ class Trainer:
         start_epoch: int,
     ) -> dict[str, list[float]]:
         num_epochs = self.config.training.num_epochs
-        mode = "distill" if self.distill else "baseline"
 
         for epoch in range(start_epoch, num_epochs):
             self.optimizer.train()
             self.model.train()
-            if self.distill:
-                train_metrics = self._train_epoch_distill(train_loader)
-            else:
-                train_metrics = self._train_epoch_baseline(train_loader)
+            train_metrics = self._train_epoch(train_loader)
 
             self.optimizer.eval()
             val_metrics = evaluate_model(

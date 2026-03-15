@@ -30,19 +30,19 @@ def evaluate_model(
     acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").cuda()
     acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro").cuda()
 
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0, device="cuda")
     total = 0
 
     for batch in data_loader:
-        inputs = batch["pixel_values"].cuda()
-        targets = batch["label"].cuda()
+        inputs = batch["pixel_values"].cuda(non_blocking=True)
+        targets = batch["label"].cuda(non_blocking=True)
 
         outputs = model(inputs)
 
         if valid_indices is not None:
             outputs = outputs[:, valid_indices]
 
-        total_loss += criterion(outputs, targets).item() * inputs.size(0)
+        total_loss += criterion(outputs, targets).detach() * inputs.size(0)
         total += targets.size(0)
 
         acc_top1.update(outputs, targets)
@@ -51,7 +51,7 @@ def evaluate_model(
     return {
         "val_acc": 100.0 * acc_top1.compute().item(),
         "val_acc_top5": 100.0 * acc_top5.compute().item(),
-        "loss": total_loss / total,
+        "loss": (total_loss / total).item(),
     }
 
 
